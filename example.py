@@ -15,13 +15,13 @@ gait = Gait(
     h_des=0.445,
     eps_min=0.2,
     weights = jnp.array([10.0e4, 0.001, 7.0, 100.0, 3.0, 0.01, 2.0, 0.001]),
-    desired_base_velocity = jnp.array([0.2, 0.0, 0.0]),
+    desired_base_velocity = jnp.array([0.1, 0.0, 0.0]),
     desired_base_angular_velocity = jnp.array([0.0, 0.0, 0.0]),
     apex_height=0.1,
 )
 
-h = jnp.array(get_flat_heightmap(a=300, b=300, height=0.0))  # Flat heightmap for testing
-# h = jnp.array(get_rough_terrain_heightmap(a=350, b=350, sigma=0.02, platform_height=0.0, platform_size=5, smooth_sigma=2, seed=42)) # Heightmap with platforms
+# h = jnp.array(get_flat_heightmap(a=300, b=300, height=0.0))  # Flat heightmap for testing
+h = jnp.array(get_rough_terrain_heightmap(a=350, b=350, sigma=0.05, platform_height=0.0, platform_size=5, smooth_sigma=3, seed=42)) # Heightmap with platforms
 # h = jnp.array(get_stairs_heightmap(a=300, b=300, start_col=200, step_depth=100, step_height=0.1))  # Heightmap with stairs
 
 grid_cell_length = 0.01  # Length of grid cells in heightmap
@@ -77,7 +77,7 @@ problem = TAMOLS(x0, gait, terrain, robot, currentstate)
 
 sols, infos = problem.run_repeated_optimizations({
             "max_iter": 300,
-            "acceptable_tol": 1e-4
+            "acceptable_tol": 1e-3
         })
 
 plot_all_iterations(sols, problem, dt=0.02)

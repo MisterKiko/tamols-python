@@ -65,7 +65,7 @@ if __name__ == "__main__":
 
     #heightmap = get_heightmap_with_platforms_and_holes(a=100,b=100,hole_size=10,hole_number=2,platform_size=10,platform_height=0.1)
     #heightmap = get_stairs_heightmap(a=300, b=300, start_col=200, step_depth=30, step_height=0.05)  # Heightmap with stairs
-    heightmap = get_rough_terrain_heightmap(a=350, b=350, sigma=0.02, platform_height=0.0, platform_size=5, smooth_sigma=2, seed=42) # Heightmap with platforms
+    heightmap = get_rough_terrain_heightmap(a=350, b=350, sigma=0.05, platform_height=0.0, platform_size=5, smooth_sigma=3, seed=42) # Heightmap with platforms
 
     save_heightmap_to_png(heightmap, "outputs/heightmap.png")
 
