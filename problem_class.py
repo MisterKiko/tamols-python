@@ -1,0 +1,497 @@
+from tamols_dataclasses import *
+import numpy as np
+import jax.numpy as jnp
+from cost_parts import *
+from jax.flatten_util import ravel_pytree
+from jax import vmap, jit, value_and_grad, jacfwd, jacrev
+import cyipopt
+from helpers import (
+    evaluate_spline_position,
+    evaluate_spline_velocity,
+    evaluate_spline_acceleration,
+    euler_xyz_to_matrix,
+    robust_norm,
+    scalar_triple_product,
+    angular_momentum_dot_world_from_euler_xyz
+)
+import itertools
+from jax import debug as jdebug
+
+class TAMOLS():
+    def __init__(self, x0: np.ndarray, gait: Gait, terrain: Terrain, robot: Robot, current_state: CurrentState,
+                 x_lb: np.ndarray = None, x_ub: np.ndarray = None):
+        self.gait = gait
+        self.terrain = terrain
+        self.robot = robot
+        self.current_state = current_state
+
+        # Decision vector and bounds
+        x0 = np.asarray(x0, dtype=float)
+        self.n = int(x0.size)
+        self.x0 = x0
+        self.lb = np.full(self.n, -np.inf) if x_lb is None else np.asarray(x_lb, dtype=float)
+        self.ub = np.full(self.n,  np.inf) if x_ub is None else np.asarray(x_ub, dtype=float)
+
+        # Precompute limb centers and previous footholds
+        self._limb_centers = jnp.stack([robot.r_1, robot.r_2, robot.r_3, robot.r_4])
+        #self._prev_feet = jnp.stack([current_state.p_1_meas, current_state.p_2_meas,
+        #                             current_state.p_3_meas, current_state.p_4_meas])
+
+        self.T_k = gait.tau_k / 6.0  # nominal timestep per phase (s)
+        # Uniform per‑phase timestep grid (use a fixed samples-per-phase)
+        N = 6
+        t_idx = jnp.arange(1, N+1, dtype=jnp.float32)  # 1..6
+        # Broadcast multiply: (n_phases, 1) * (1, 6) -> (n_phases, 6)
+        self._timesteps = self.T_k[:, None] * t_idx[None, :]
+
+        # Pair indices for leg collision cost
+        pairs = np.array([(i, j) for i in range(4) for j in range(i + 1, 4)], dtype=np.int32)
+        self._pairs = jnp.asarray(pairs)
+
+        # Build a template to define x’s structure and get unravel_fn
+        tpl = {
+            "a_pos": jnp.zeros((self.gait.n_phases, 3, self.gait.spline_order + 1)),
+            "a_rot": jnp.zeros((self.gait.n_phases, 3, self.gait.spline_order + 1)),
+            "p_1": robot.p_1_start,
+            "p_2": robot.p_2_start,
+            "p_3": robot.p_3_start,
+            "p_4": robot.p_4_start,
+            "slack_var": jnp.ones(self.gait.n_phases)
+        }
+        _, self._unravel = ravel_pytree(tpl)
+
+        # Param-aware (x, current_state) functions; no closure over current_state
+        self._f_valgrad = jit(value_and_grad(lambda x, cs: self.compute_objective(x, cs)))
+        self._c_eq      = jit(lambda x, cs: self.compute_eq_constraints(x, cs))
+        self._c_ineq    = jit(lambda x, cs: self.compute_ineq_constraints(x, cs))
+        self._c_all     = jit(lambda x, cs: jnp.concatenate([self._c_eq(x, cs), self._c_ineq(x, cs)]))
+        self._J_all     = jit(jacfwd(lambda x, cs: self._c_all(x, cs), argnums=0))
+        self._hess_L    = jit(jacfwd(jacrev(lambda x, lam, rho, cs:
+                                             rho * self.compute_objective(x, cs)
+                                             + jnp.dot(lam, self._c_all(x, cs)),
+                                           argnums=0),
+                                     argnums=0))
+
+        x0_j = jnp.asarray(x0)
+        c_eq0 = self._c_eq(x0_j, self.current_state)
+        c_in0 = self._c_ineq(x0_j, self.current_state)
+        m_eq   = int(np.asarray(c_eq0).size)
+        m_ineq = int(np.asarray(c_in0).size)
+        self.m = m_eq + m_ineq
+        self.cl = np.concatenate([
+            np.zeros(m_eq, dtype=float),
+            np.zeros(m_ineq, dtype=float)
+        ])
+        self.cu = np.concatenate([
+            np.zeros(m_eq, dtype=float),
+            np.full(m_ineq, np.inf, dtype=float)
+        ])
+
+        # Dense Jacobian structure (row-major)
+        if self.m > 0:
+            rows = np.repeat(np.arange(self.m), self.n).astype(np.int64)
+            cols = np.tile(np.arange(self.n), self.m).astype(np.int64)
+        else:
+            rows = np.array([], dtype=np.int64)
+            cols = np.array([], dtype=np.int64)
+        self._jac_rows, self._jac_cols = rows, cols
+
+        # Lower-triangular sparsity pattern (Ipopt expects symmetric lower triangle)
+        tri = np.tril_indices(self.n)
+        self._H_rows = tri[0].astype(np.int64)
+        self._H_cols = tri[1].astype(np.int64)
+
+     # -------- helpers used inside the objective --------
+    def _cost_at_t(self, a_pos, a_rot, t, limb_center, T_k_phase):
+        w = self.gait.weights
+        p_B = evaluate_spline_position(a_pos, t)
+        phi_B = evaluate_spline_position(a_rot, t)
+        R_B = euler_xyz_to_matrix(phi_B)
+        p_B_dot = evaluate_spline_velocity(a_pos, t)
+        phi_B_dot = evaluate_spline_velocity(a_rot, t)
+        phi_B_dotdot = evaluate_spline_acceleration(a_rot, t)
+
+        c4 = w[3] * T_k_phase * base_pose_alignment_cost(
+            p_B, self.gait.h_des, limb_center, R_B,
+            self.terrain.h_s2, self.terrain.grid_cell_length
+        )
+        c7 = w[6] * T_k_phase * tracking_cost(
+            p_B_dot, phi_B, phi_B_dot, self.gait.desired_base_velocity,
+            self.gait.desired_base_angular_velocity, self.robot.mass,
+            self.robot.inertia
+        )
+        c8 = w[7] * T_k_phase * smoothness_cost(phi_B, phi_B_dot, phi_B_dotdot, self.robot.inertia)
+        return c4 + c7 + c8
+
+    def _cost_of_phase(self, a_pos_phase, a_rot_phase, timesteps_phase, limb_center, T_k_phase):
+        return jnp.sum(vmap(lambda t: self._cost_at_t(a_pos_phase, a_rot_phase, t, limb_center, T_k_phase))(timesteps_phase))
+
+    # ----------------- x-only objective -----------------
+    def compute_objective(self, x: jnp.ndarray, cs: CurrentState) -> jnp.ndarray:
+        sv = self._unravel(x)
+
+        # Coerce measured feet to JAX arrays once (fixed shapes/dtypes)
+        m1 = jnp.asarray(cs.p_1_meas)
+        m2 = jnp.asarray(cs.p_2_meas)
+        m3 = jnp.asarray(cs.p_3_meas)
+        m4 = jnp.asarray(cs.p_4_meas)
+
+        # Decision variables
+        a_pos = sv["a_pos"]  # (n_phases, 3, k+1)
+        a_rot = sv["a_rot"]  # (n_phases, 3, k+1)
+        feet = jnp.stack([sv["p_1"], sv["p_2"], sv["p_3"], sv["p_4"]])  # (4,3)
+        feet_midstance = jnp.stack([sv["p_1"], m2, m3, sv["p_4"]])  # (4,3)
+        feet_prev = jnp.stack([m1, m2, m3, m4])  # (4,3)
+
+        # Mid-phase pose used in some foothold costs
+        mid_phase = int(self.gait.n_phases // 2)
+        ts_mid = self._timesteps[mid_phase]
+        t_mid = ts_mid[ts_mid.shape[0] // 2]
+        p_B_mid = evaluate_spline_position(a_pos[mid_phase], t_mid)
+        phi_B_mid = evaluate_spline_position(a_rot[mid_phase], t_mid)
+        R_B_mid = euler_xyz_to_matrix(phi_B_mid)
+
+        w = self.gait.weights
+    
+
+        # Per-limb "static" foothold costs
+        def limb_static_cost(foot, limb_center, prev_foot):
+            c1 = w[0] * foothold_on_ground_cost(foot, self.terrain.heightmap, self.terrain.grid_cell_length)
+            c3 = w[2] * nominal_kinematics_cost(p_B_mid, foot, self.gait.h_des, limb_center, R_B_mid)
+            c5 = w[4] * edge_avoidance_cost(self.terrain.grad_h_x, self.terrain.grad_h_y,
+                                            self.terrain.grad_h_s1_x, self.terrain.grad_h_s1_y,
+                                            foot, self.terrain.grid_cell_length)
+            c6 = w[5] * previous_solution_cost(foot, prev_foot)
+            return c1 + c3 + c5 + c6
+
+        static_costs = vmap(limb_static_cost)(feet, self._limb_centers, feet_prev)
+
+        # Per-limb, per-phase spline costs
+        phase_idx = jnp.arange(self.gait.n_phases)
+        def limb_phase_sum(a_pos_all, a_rot_all, limb_center):
+            return jnp.sum(vmap(lambda n: self._cost_of_phase(a_pos_all[n], a_rot_all[n],
+                                                             self._timesteps[n], limb_center, self.T_k[n]))(phase_idx))
+        spline_costs = vmap(lambda lc: limb_phase_sum(a_pos, a_rot, lc))(self._limb_centers)
+
+        # Pairwise foot collision avoidance
+        pair_costs = vmap(lambda pair: w[1] * leg_collision_avoidance_cost(
+            feet[pair[0]], feet[pair[1]], self.gait.eps_min))(self._pairs)
+
+        pair_costs_midstance = vmap(lambda pair: w[1] * leg_collision_avoidance_cost(
+            feet_midstance[pair[0]], feet_midstance[pair[1]], self.gait.eps_min))(self._pairs)
+
+        return jnp.sum(static_costs) + jnp.sum(spline_costs) + jnp.sum(pair_costs) + jnp.sum(pair_costs_midstance) + slack_variables_cost(sv["slack_var"])
+    
+        # ----------------- x-only equality constraints -----------------
+    def compute_eq_constraints(self, x: jnp.ndarray, cs: CurrentState) -> jnp.ndarray:
+        sv = self._unravel(x)
+
+        # Initial conditions (phase 0, t=0)
+        p0_err   = evaluate_spline_position(sv["a_pos"][0], 0.0) - cs.initial_base_pose[:3]
+        r0_err   = evaluate_spline_position(sv["a_rot"][0], 0.0) - cs.initial_base_pose[3:]
+        v0_err   = evaluate_spline_velocity(sv["a_pos"][0], 0.0) - cs.initial_base_velocity[:3]
+        w0_err   = evaluate_spline_velocity(sv["a_rot"][0], 0.0) - cs.initial_base_velocity[3:]
+
+        # Junction continuity between consecutive phases (pos and vel for pos/rot)
+        def junction(i):
+            ti = self.gait.tau_k[i]
+            return jnp.concatenate([
+                evaluate_spline_position(sv["a_pos"][i], ti) - evaluate_spline_position(sv["a_pos"][i+1], 0.0),
+                evaluate_spline_position(sv["a_rot"][i], ti) - evaluate_spline_position(sv["a_rot"][i+1], 0.0),
+                evaluate_spline_velocity(sv["a_pos"][i], ti) - evaluate_spline_velocity(sv["a_pos"][i+1], 0.0),
+                evaluate_spline_velocity(sv["a_rot"][i], ti) - evaluate_spline_velocity(sv["a_rot"][i+1], 0.0),
+            ])
+
+        if self.gait.n_phases > 1:
+            jcs = vmap(junction)(jnp.arange(self.gait.n_phases - 1)).reshape(-1)
+            eq = jnp.concatenate([p0_err, r0_err, v0_err, w0_err, jcs])
+        else:
+            eq = jnp.concatenate([p0_err, r0_err, v0_err, w0_err])
+
+        return eq
+    
+    # ----------------- x-only inequality constraints -----------------
+    def compute_ineq_constraints(self, x: jnp.ndarray, cs: CurrentState) -> jnp.ndarray:
+        sv = self._unravel(x)
+        g = self.terrain.gravity
+        mass = self.robot.mass
+        inertia = self.robot.inertia
+        mu = self.terrain.mu
+        e_z = jnp.array([0.0, 0.0, 1.0])
+
+        # Coerce measured feet once
+        m1 = jnp.asarray(cs.p_1_meas)
+        m2 = jnp.asarray(cs.p_2_meas)
+        m3 = jnp.asarray(cs.p_3_meas)
+        m4 = jnp.asarray(cs.p_4_meas)
+
+        # Simple vertical-accel constraint: a_z(t) - g_z >= 0
+        def az_minus_g_phase(phase):
+            a_pos = sv["a_pos"][phase]
+            ts = self._timesteps[phase]
+            def at_t(t):
+                acc = evaluate_spline_acceleration(a_pos, t)  # p¨_B
+                return acc[2] - g[2]
+            return vmap(at_t)(ts)
+        az_g = jnp.concatenate([az_minus_g_phase(p) for p in range(self.gait.n_phases)])
+
+        # A) Friction cone over all phases/timesteps: mu*(-a_Bz) - ||a_Bxy|| >= 0
+        def friction_phase(phase):
+            a_pos = sv["a_pos"][phase]
+            ts = self._timesteps[phase]
+            def at_t(t):
+                p_B_dd = evaluate_spline_acceleration(a_pos, t)
+                a_B = g - p_B_dd
+                return mu * (-a_B[2]) - robust_norm(a_B[:2])
+            return vmap(at_t)(ts)
+        fric = jnp.concatenate([friction_phase(p) for p in range(self.gait.n_phases)])
+
+        # Dynamic equality constraintsfs
+        g = self.terrain.gravity
+        mass = self.robot.mass
+        inertia = self.robot.inertia
+
+        def dyn_phase(phase, p_i, p_j):
+            a_pos, a_rot = sv["a_pos"][phase], sv["a_rot"][phase]
+            ts = jnp.array([0.0, self._timesteps[phase][-1]])
+            p_ij = p_j - p_i
+            eps = sv["slack_var"][phase]
+            def at_t(t):
+                p_B    = evaluate_spline_position(a_pos, t)
+                p_B_dd = evaluate_spline_acceleration(a_pos, t)
+                a_B = g - p_B_dd
+
+                phi_B  = evaluate_spline_position(a_rot, t)
+                phi_d = evaluate_spline_velocity(a_rot, t)
+                phi_dd = evaluate_spline_acceleration(a_rot, t)
+                L_B_dot = angular_momentum_dot_world_from_euler_xyz(phi_B, phi_d, phi_dd, inertia)
+                con_dyn = jnp.dot(p_ij, L_B_dot) - mass * scalar_triple_product(p_ij, p_B - p_i, a_B)
+                return jnp.array([con_dyn + eps, -con_dyn + eps])
+
+            return vmap(at_t)(ts)
+
+        # Use measured feet in phase 0, decision feet in phase 2
+        if self.gait.n_phases >= 3:
+            c1 = dyn_phase(0, m2, m3)
+            c2 = dyn_phase(2, sv["p_1"], sv["p_4"])
+            dyn_eq = jnp.concatenate([c1.reshape(-1), c2.reshape(-1)])
+        else:
+            dyn_eq = jnp.zeros((0,), dtype=sv["p_1"].dtype)
+
+
+        # B) Extra “moment” constraints for phases 0 and 2 (needs to be updated if gait changes)
+        def extra_phase(phase, p_i, p_j, eps):
+            a_pos, a_rot = sv["a_pos"][phase], sv["a_rot"][phase]
+            ts = jnp.array([0.0, self._timesteps[phase][-1]])
+            p_ij = p_j - p_i
+            def at_t(t):
+                p_B    = evaluate_spline_position(a_pos, t)
+                p_B_dd = evaluate_spline_acceleration(a_pos, t)
+                phi_B  = evaluate_spline_position(a_rot, t)
+                phi_d = evaluate_spline_velocity(a_rot, t)
+                phi_dd = evaluate_spline_acceleration(a_rot, t)
+                L_B_dot = angular_momentum_dot_world_from_euler_xyz(phi_B, phi_d, phi_dd, inertia)
+                a_B = g - p_B_dd
+                M_i = jnp.cross((p_B - p_i), a_B) - L_B_dot / mass
+                return scalar_triple_product(e_z, p_ij, M_i) + eps
+            return vmap(at_t)(ts)
+
+        extras = []
+        if self.gait.n_phases >= 1:
+            extras.append(extra_phase(0, m2, m3, sv["slack_var"][0]))
+        if self.gait.n_phases >= 3:
+            extras.append(extra_phase(2, sv["p_1"], sv["p_4"], sv["slack_var"][2]))
+        extra_all = jnp.concatenate(extras) if extras else jnp.zeros((0,), dtype=sv["p_1"].dtype)
+
+        def dyn_phase_17b(pair, phase):
+            i , j = pair
+            foot_positions = jnp.stack([sv["p_1"], m2, m3, sv["p_4"]])
+            p_i, p_j = foot_positions[i], foot_positions[j]
+            a_pos, a_rot = sv["a_pos"][phase], sv["a_rot"][phase]
+            ts = jnp.array([0.0, self._timesteps[phase][-1]])
+            p_ij = p_j - p_i
+            eps = sv["slack_var"][phase]
+            def at_t(t):
+                p_B    = evaluate_spline_position(a_pos, t)
+                p_B_dd = evaluate_spline_acceleration(a_pos, t)
+                a_B = g - p_B_dd
+
+                phi_B  = evaluate_spline_position(a_rot, t)
+                phi_d = evaluate_spline_velocity(a_rot, t)
+                phi_dd = evaluate_spline_acceleration(a_rot, t)
+                L_B_dot = angular_momentum_dot_world_from_euler_xyz(phi_B, phi_d, phi_dd, inertia)
+
+                return jnp.array(jnp.dot(p_ij, L_B_dot) - mass * scalar_triple_product(p_ij, p_B - p_i, a_B) + eps)
+
+            return vmap(at_t)(ts)
+        
+        dyn_ineq = vmap(lambda pair: dyn_phase_17b(pair, 1))(self._pairs).reshape(-1)
+
+        # C) Convex GIAC (two stance configs)
+        def giac_block(p1, p2, p3, p4):
+            p_12, p_13, p_14 = p2 - p1, p3 - p1, p4 - p1
+            p_21, p_23, p_24 = p1 - p2, p3 - p2, p4 - p2
+            # Enforce consistent winding: orient_sign=+1 for CCW, -1 for CW
+            return  jnp.array([
+                jnp.dot(jnp.cross(p_13, p_12), e_z),
+                jnp.dot(jnp.cross(p_14, p_13), e_z),
+                jnp.dot(jnp.cross(p_24, p_23), e_z),
+                jnp.dot(jnp.cross(p_21, p_24), e_z),
+            ])
+
+        # Use consistent order [p1(FL), p2(FR), p4(RR), p3(RL)]
+        c_giac_1 = giac_block(sv["p_1"], m2, sv["p_4"], m3)
+        c_giac_2 = giac_block(sv["p_1"], sv["p_2"], sv["p_4"], sv["p_3"])
+        giac = jnp.concatenate([c_giac_1, c_giac_2])
+
+        # D) Kinematic leg-length bounds per phase/timestep/leg
+        feet = jnp.stack([sv["p_1"], sv["p_2"], sv["p_3"], sv["p_4"]])
+        limb_centers = self._limb_centers
+        l_min, l_max = self.robot.l_min, self.robot.l_max
+
+        def kin_phase(phase):
+            a_pos = sv["a_pos"][phase]
+            a_rot = sv["a_rot"][phase]
+            ts = self._timesteps[phase]
+            def at_t(t):
+                p_B  = evaluate_spline_position(a_pos, t)
+                phi  = evaluate_spline_position(a_rot, t)
+                R_B  = euler_xyz_to_matrix(phi)
+                def per_leg(foot, limb_center):
+                    leg_vec = p_B + R_B @ limb_center - foot
+                    ll2 = robust_norm(leg_vec)**2
+                    return jnp.array([ll2 - l_min**2, l_max**2 - ll2])
+                return vmap(per_leg)(feet, limb_centers).reshape(-1)
+            return vmap(at_t)(ts).reshape(-1)
+        kin = jnp.concatenate([kin_phase(p) for p in range(self.gait.n_phases)])
+
+        # E) Slack vars >= 0
+        slack_var_constr = sv["slack_var"]  # (n_phases,)
+
+        return jnp.concatenate([fric, kin, az_g, slack_var_constr, extra_all, giac, dyn_eq, dyn_ineq])
+    
+    # ============== Ipopt callbacks ==============
+    def objective(self, x):
+        v, _ = self._f_valgrad(jnp.asarray(x), self.current_state)
+        return float(v)
+
+    def gradient(self, x):
+        _, g = self._f_valgrad(jnp.asarray(x), self.current_state)
+        return np.asarray(g, dtype=float)
+
+    def constraints(self, x):
+        c = self._c_all(jnp.asarray(x), self.current_state)
+        return np.asarray(c, dtype=float)
+
+    def jacobian(self, x):
+        if self.m == 0:
+            return np.array([], dtype=float)
+        J = self._J_all(jnp.asarray(x), self.current_state)
+        return np.asarray(J, dtype=float).ravel(order="C")
+
+    def jacobianstructure(self):
+        if self.m == 0:
+            return (np.array([], dtype=np.int64), np.array([], dtype=np.int64))
+        return (self._jac_rows, self._jac_cols)
+
+    def hessianstructure(self):
+        # Lower-triangular structure
+        return (self._H_rows, self._H_cols)
+
+    def hessian(self, x, lagrange, obj_factor):
+        H = self._hess_L(jnp.asarray(x),
+                        jnp.asarray(lagrange),
+                        jnp.asarray(obj_factor),
+                        self.current_state)
+        H = np.asarray(H, dtype=float)
+        return H[(self._H_rows, self._H_cols)]
+
+    # Solve helper
+    def run_single_optimization(self, options: dict | None = None):
+        x0 = self.x0
+        nlp = cyipopt.Problem(
+            n=self.n, m=self.m, problem_obj=self,
+            lb=self.lb, ub=self.ub, cl=self.cl, cu=self.cu
+        )
+        ipopt_opts = {
+            "hessian_approximation": "exact",
+            "print_level": 0,      # silence IPOPT
+            "sb": "yes",           # (small banner) further reduce output
+            "max_iter": 300,
+            "tol": 1e-8,
+            "acceptable_tol": 1e-4,
+            "print_timing_statistics": "no"
+        }
+        if options:
+            ipopt_opts.update(options)
+        for k, v in ipopt_opts.items():
+            nlp.add_option(k, v)
+        x_sol, info = nlp.solve(np.asarray(x0, dtype=float))
+        return x_sol, info
+    
+    def run_repeated_optimizations(self, options: dict | None = None):
+        n_steps = int(self.gait.n_steps)
+        sols, infos = [], []
+        x_curr = np.asarray(self.x0, dtype=float)
+        print("Setting up optimization...")
+
+        for k in range(n_steps):
+            self.x0 = x_curr
+            x_sol, info = self.run_single_optimization(options)
+            sols.append(x_sol); infos.append(info)
+
+            # Report only final objective per run
+            final_obj = self.objective(x_sol)
+            print(f"Optimization {k+1}/{n_steps}: objective = {final_obj:.6f}")
+
+            sv_sol = self._unravel(jnp.asarray(x_sol))
+            next_state = update_state_from_solution(self, sv_sol)
+            self.current_state = next_state  # just update; no re-JIT needed
+
+            x_curr = np.asarray(build_initial_x0(self.gait, next_state), dtype=float)
+
+        return sols, infos
+ 
+def update_state_from_solution(problem: TAMOLS, sv_sol):
+    # End of last phase
+    p_last = int(problem.gait.n_phases) - 1
+    t_end = float(problem._timesteps[p_last, -1])
+    a_pos_last = sv_sol["a_pos"][p_last]
+    a_rot_last = sv_sol["a_rot"][p_last]
+    p_end = evaluate_spline_position(a_pos_last, t_end)
+    r_end = evaluate_spline_position(a_rot_last, t_end)
+    v_end = evaluate_spline_velocity(a_pos_last, t_end)
+    w_end = evaluate_spline_velocity(a_rot_last, t_end)
+
+    p1m, p2m, p3m, p4m = sv_sol["p_1"], sv_sol["p_2"], sv_sol["p_3"], sv_sol["p_4"]
+
+    return CurrentState(
+        p_1_meas=p1m,
+        p_2_meas=p2m,
+        p_3_meas=p3m,
+        p_4_meas=p4m, 
+        initial_base_pose=jnp.concatenate([p_end, r_end]),
+        initial_base_velocity=jnp.concatenate([v_end, w_end]),
+    )
+
+
+def build_initial_x0(gait: Gait, state: CurrentState) -> np.ndarray:
+    a_pos = jnp.zeros((gait.n_phases, 3, gait.spline_order + 1))
+    a_rot = jnp.zeros((gait.n_phases, 3, gait.spline_order + 1))
+    # Seed constant terms with initial base pose/orientation for every phase
+    a_pos = a_pos.at[:, :, 0].set(state.initial_base_pose[:3])
+    a_rot = a_rot.at[:, :, 0].set(state.initial_base_pose[3:])
+    #a_pos = a_pos.at[:, :, 1].set(state.initial_base_velocity[:3])
+    #a_rot = a_rot.at[:, :, 1].set(state.initial_base_velocity[3:])
+
+    tpl = {
+        "a_pos": a_pos,
+        "a_rot": a_rot,
+        "p_1": state.p_1_meas,
+        "p_2": state.p_2_meas,
+        "p_3": state.p_3_meas,
+        "p_4": state.p_4_meas,
+        "slack_var": jnp.zeros(gait.n_phases),
+    }
+    x0, _ = ravel_pytree(tpl)
+    return np.asarray(x0, dtype=float)
