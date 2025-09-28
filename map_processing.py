@@ -1,5 +1,7 @@
 from scipy import ndimage
 import numpy as np
+from pathlib import Path
+from PIL import Image  # Pillow is standard for PNG writing
 
 def compute_heightmap_gradients(height_map,grid_cell_length):
     """
@@ -50,3 +52,53 @@ def get_hs2(h_raw, median_kernel=25, dilation_kernel=25, sigma=5.0, limit=0.05):
     h_s2 = ndimage.gaussian_filter(h_s2, sigma)
 
     return h_s2
+
+
+def save_heightmap_to_png(heightmap, filepath, vmin=None, vmax=None, invert=False, ensure_parent=True):
+    """Save a 2D heightmap array as an 8-bit grayscale PNG (black=low, white=high).
+
+    Args:
+        heightmap: 2D array-like (NumPy or JAX DeviceArray) of shape (H, W).
+        filepath: Output file path (str or Path). Extension ".png" will be appended if missing.
+        vmin: Optional lower bound for normalization. If None, uses heightmap min.
+        vmax: Optional upper bound for normalization. If None, uses heightmap max.
+        invert: If True, invert grayscale (so higher values darker instead of lighter).
+        ensure_parent: Create parent directories if they don't exist.
+
+    Behavior:
+        Scales values linearly: val -> (val - vmin)/(vmax - vmin) * 255, clipped to [0,255].
+        If vmin == vmax (constant map), outputs mid-gray (128) everywhere.
+
+    Raises:
+        ValueError: If input is not 2D.
+        RuntimeError: If Pillow is not installed.
+    """
+    if Image is None:
+        raise RuntimeError("Pillow (PIL) is required to save PNGs. Install with 'pip install Pillow'.")
+
+    arr = np.array(heightmap)  # Converts JAX DeviceArray transparently if needed
+    if arr.ndim != 2:
+        raise ValueError(f"Heightmap must be 2D, got shape {arr.shape}.")
+
+    # Determine normalization range
+    data_min = float(arr.min()) if vmin is None else float(vmin)
+    data_max = float(arr.max()) if vmax is None else float(vmax)
+
+    if data_max == data_min:
+        norm = np.full_like(arr, 128, dtype=np.uint8)
+    else:
+        scale = 255.0 / (data_max - data_min)
+        norm = ((arr - data_min) * scale).clip(0, 255)
+        if invert:
+            norm = 255 - norm
+        norm = norm.astype(np.uint8)
+
+    fp = Path(filepath)
+    if fp.suffix.lower() != '.png':
+        fp = fp.with_suffix('.png')
+    if ensure_parent:
+        fp.parent.mkdir(parents=True, exist_ok=True)
+
+    img = Image.fromarray(norm, mode='L')  # 'L' = 8-bit grayscale
+    img.save(fp)
+    return fp
