@@ -1,11 +1,11 @@
-from tamols_dataclasses import *
+from .tamols_dataclasses import *
 import numpy as np
 import jax.numpy as jnp
-from cost_parts import *
+from .cost_parts import *
 from jax.flatten_util import ravel_pytree
 from jax import vmap, jit, value_and_grad, jacfwd, jacrev
 import cyipopt
-from helpers import (
+from .helpers import (
     evaluate_spline_position,
     evaluate_spline_velocity,
     evaluate_spline_acceleration,
@@ -14,7 +14,6 @@ from helpers import (
     scalar_triple_product,
     angular_momentum_dot_world_from_euler_xyz
 )
-import itertools
 from jax import debug as jdebug
 
 class TAMOLS():
@@ -27,7 +26,6 @@ class TAMOLS():
 
         self.h_s1 = jnp.array(get_hs1(terrain.heightmap))
         self.h_s2 = jnp.array(get_hs2(terrain.heightmap))
-        # Compute gradients once per map; NOTE: trailing commas would make these tuples, so avoid them.
         gxh, gyh = compute_heightmap_gradients(self.terrain.heightmap, self.terrain.grid_cell_length)
         gx1, gy1 = compute_heightmap_gradients(self.h_s1, self.terrain.grid_cell_length)
         self.grad_h_x = jnp.array(gxh)

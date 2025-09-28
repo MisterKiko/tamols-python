@@ -1,5 +1,5 @@
-from manual_heightmaps import *
-from map_processing import *
+from .manual_heightmaps import *
+from .map_processing import *
 import matplotlib.pyplot as plt
 
 def show_map(h):

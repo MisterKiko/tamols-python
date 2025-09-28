@@ -1,9 +1,9 @@
 import numpy as np
 import matplotlib.pyplot as plt
-from tamols_dataclasses import *
-from problem_class import TAMOLS
-from trajectory import get_trajectory_function
-from helpers import euler_xyz_to_matrix  # if you want full frame plotting (optional)
+from .tamols_dataclasses import *
+from .problem_class import TAMOLS
+from .trajectory import get_trajectory_function
+from .helpers import euler_xyz_to_matrix  # if you want full frame plotting (optional)
 
 def plot_all_iterations(sols, problem: TAMOLS, dt: float = 0.02):
     """

@@ -1,8 +1,8 @@
 import numpy as np
 from scipy.interpolate import CubicSpline
-from helpers import *
-from tamols_dataclasses import *
-from problem_class import TAMOLS
+from .helpers import *
+from .tamols_dataclasses import *
+from .problem_class import TAMOLS
 
 def _build_leg_spline(p_start: np.ndarray, p_end: np.ndarray, apex_height: float):
     line_vec = p_end - p_start

@@ -1,7 +1,7 @@
 import jax.numpy as jnp
-from manual_heightmaps import *
-from helpers import *
-from map_processing import *
+from .manual_heightmaps import *
+from .helpers import *
+from .map_processing import *
 
 
 def foothold_on_ground_cost(p, heightmap, grid_cell_length):

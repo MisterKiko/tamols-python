@@ -1,4 +1,4 @@
-from jax import jit, jacfwd, jacrev
+from jax import jacfwd, jacrev
 import jax.numpy as jnp
 
 def euler_xyz_to_matrix(phi):
