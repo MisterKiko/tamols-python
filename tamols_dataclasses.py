@@ -18,13 +18,7 @@ class Gait:
 @dataclass
 class Terrain:
     heightmap: jnp.ndarray # Original heightmap
-    h_s1: jnp.ndarray # Smoothed heightmap
-    h_s2: jnp.ndarray # Virtual floor heightmap
     grid_cell_length: float # Length of grid cells in heightmap
-    grad_h_x: jnp.ndarray # Gradient of heightmap in x direction
-    grad_h_y: jnp.ndarray # Gradient of heightmap in y direction
-    grad_h_s1_x: jnp.ndarray # Gradient of smoothed heightmap in x direction
-    grad_h_s1_y: jnp.ndarray # Gradient of smoothed heightmap in y direction
     mu: float # Friction coefficient
     gravity: jnp.ndarray # Gravity vector
 

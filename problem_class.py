@@ -25,6 +25,16 @@ class TAMOLS():
         self.robot = robot
         self.current_state = current_state
 
+        self.h_s1 = jnp.array(get_hs1(terrain.heightmap))
+        self.h_s2 = jnp.array(get_hs2(terrain.heightmap))
+        # Compute gradients once per map; NOTE: trailing commas would make these tuples, so avoid them.
+        gxh, gyh = compute_heightmap_gradients(self.terrain.heightmap, self.terrain.grid_cell_length)
+        gx1, gy1 = compute_heightmap_gradients(self.h_s1, self.terrain.grid_cell_length)
+        self.grad_h_x = jnp.array(gxh)
+        self.grad_h_y = jnp.array(gyh)
+        self.grad_h_s1_x = jnp.array(gx1)
+        self.grad_h_s1_y = jnp.array(gy1)
+
         # Decision vector and bounds
         x0 = np.asarray(x0, dtype=float)
         self.n = int(x0.size)
@@ -113,7 +123,7 @@ class TAMOLS():
 
         c4 = w[3] * T_k_phase * base_pose_alignment_cost(
             p_B, self.gait.h_des, limb_center, R_B,
-            self.terrain.h_s2, self.terrain.grid_cell_length
+            self.h_s2, self.terrain.grid_cell_length
         )
         c7 = w[6] * T_k_phase * tracking_cost(
             p_B_dot, phi_B, phi_B_dot, self.gait.desired_base_velocity,
@@ -158,8 +168,8 @@ class TAMOLS():
         def limb_static_cost(foot, limb_center, prev_foot):
             c1 = w[0] * foothold_on_ground_cost(foot, self.terrain.heightmap, self.terrain.grid_cell_length)
             c3 = w[2] * nominal_kinematics_cost(p_B_mid, foot, self.gait.h_des, limb_center, R_B_mid)
-            c5 = w[4] * edge_avoidance_cost(self.terrain.grad_h_x, self.terrain.grad_h_y,
-                                            self.terrain.grad_h_s1_x, self.terrain.grad_h_s1_y,
+            c5 = w[4] * edge_avoidance_cost(self.grad_h_x, self.grad_h_y,
+                                            self.grad_h_s1_x, self.grad_h_s1_y,
                                             foot, self.terrain.grid_cell_length)
             c6 = w[5] * previous_solution_cost(foot, prev_foot)
             return c1 + c3 + c5 + c6

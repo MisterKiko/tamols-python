@@ -24,20 +24,9 @@ gait = Gait(
 h = jnp.array(get_rough_terrain_heightmap(a=350, b=350, sigma=0.05, platform_height=0.0, platform_size=5, smooth_sigma=3, seed=42)) # Heightmap with platforms
 # h = jnp.array(get_stairs_heightmap(a=300, b=300, start_col=200, step_depth=100, step_height=0.1))  # Heightmap with stairs
 
-grid_cell_length = 0.01  # Length of grid cells in heightmap
-
-h_s1 = jnp.array(get_hs1(h))  # Smoothed heightmap
-h_s2 = jnp.array(get_hs2(h))  # Virtual floor heightmap
-
 terrain = Terrain(
     heightmap = h,
-    h_s1 = h_s1,
-    h_s2 = h_s2,
-    grid_cell_length = grid_cell_length,
-    grad_h_x = jnp.array(compute_heightmap_gradients(h, grid_cell_length)[0]),
-    grad_h_y = jnp.array(compute_heightmap_gradients(h, grid_cell_length)[1]),
-    grad_h_s1_x = jnp.array(compute_heightmap_gradients(h_s1, grid_cell_length)[0]),
-    grad_h_s1_y = jnp.array(compute_heightmap_gradients(h_s1, grid_cell_length)[1]),
+    grid_cell_length = 0.01,  # Length of grid cells in heightmap
     mu = 0.6,
     gravity = jnp.array([0.0, 0.0, -9.81]),
 )
