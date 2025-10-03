@@ -17,12 +17,19 @@ from .helpers import (
 from jax import debug as jdebug
 
 class TAMOLS():
-    def __init__(self, x0: np.ndarray, gait: Gait, terrain: Terrain, robot: Robot, current_state: CurrentState,
+    def __init__(self, gait: Gait, terrain: Terrain, robot: Robot,
                  x_lb: np.ndarray = None, x_ub: np.ndarray = None):
         self.gait = gait
         self.terrain = terrain
         self.robot = robot
-        self.current_state = current_state
+        self.current_state = CurrentState(
+            p_1_meas=robot.p_1_start,
+            p_2_meas=robot.p_2_start,
+            p_3_meas=robot.p_3_start,
+            p_4_meas=robot.p_4_start,
+            current_base_pose=robot.initial_base_pose,
+            current_base_velocity=robot.initial_base_velocity,
+        )
 
         self.h_s1 = jnp.array(get_hs1(terrain.heightmap))
         self.h_s2 = jnp.array(get_hs2(terrain.heightmap))
@@ -34,6 +41,7 @@ class TAMOLS():
         self.grad_h_s1_y = jnp.array(gy1)
 
         # Decision vector and bounds
+        x0 = build_initial_x0(gait, self.current_state)
         x0 = np.asarray(x0, dtype=float)
         self.n = int(x0.size)
         self.x0 = x0
@@ -195,10 +203,10 @@ class TAMOLS():
         sv = self._unravel(x)
 
         # Initial conditions (phase 0, t=0)
-        p0_err   = evaluate_spline_position(sv["a_pos"][0], 0.0) - cs.initial_base_pose[:3]
-        r0_err   = evaluate_spline_position(sv["a_rot"][0], 0.0) - cs.initial_base_pose[3:]
-        v0_err   = evaluate_spline_velocity(sv["a_pos"][0], 0.0) - cs.initial_base_velocity[:3]
-        w0_err   = evaluate_spline_velocity(sv["a_rot"][0], 0.0) - cs.initial_base_velocity[3:]
+        p0_err   = evaluate_spline_position(sv["a_pos"][0], 0.0) - cs.current_base_pose[:3]
+        r0_err   = evaluate_spline_position(sv["a_rot"][0], 0.0) - cs.current_base_pose[3:]
+        v0_err   = evaluate_spline_velocity(sv["a_pos"][0], 0.0) - cs.current_base_velocity[:3]
+        w0_err   = evaluate_spline_velocity(sv["a_rot"][0], 0.0) - cs.current_base_velocity[3:]
 
         # Junction continuity between consecutive phases (pos and vel for pos/rot)
         def junction(i):
@@ -478,8 +486,8 @@ def update_state_from_solution(problem: TAMOLS, sv_sol):
         p_2_meas=p2m,
         p_3_meas=p3m,
         p_4_meas=p4m, 
-        initial_base_pose=jnp.concatenate([p_end, r_end]),
-        initial_base_velocity=jnp.concatenate([v_end, w_end]),
+        current_base_pose=jnp.concatenate([p_end, r_end]),
+        current_base_velocity=jnp.concatenate([v_end, w_end]),
     )
 
 
@@ -487,10 +495,10 @@ def build_initial_x0(gait: Gait, state: CurrentState) -> np.ndarray:
     a_pos = jnp.zeros((gait.n_phases, 3, gait.spline_order + 1))
     a_rot = jnp.zeros((gait.n_phases, 3, gait.spline_order + 1))
     # Seed constant terms with initial base pose/orientation for every phase
-    a_pos = a_pos.at[:, :, 0].set(state.initial_base_pose[:3])
-    a_rot = a_rot.at[:, :, 0].set(state.initial_base_pose[3:])
-    #a_pos = a_pos.at[:, :, 1].set(state.initial_base_velocity[:3])
-    #a_rot = a_rot.at[:, :, 1].set(state.initial_base_velocity[3:])
+    a_pos = a_pos.at[:, :, 0].set(state.current_base_pose[:3])
+    a_rot = a_rot.at[:, :, 0].set(state.current_base_pose[3:])
+    #a_pos = a_pos.at[:, :, 1].set(state.current_base_velocity[:3])
+    #a_rot = a_rot.at[:, :, 1].set(state.current_base_velocity[3:])
 
     tpl = {
         "a_pos": a_pos,

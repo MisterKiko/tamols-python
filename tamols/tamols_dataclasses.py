@@ -36,6 +36,8 @@ class Robot:
     p_2_start: jnp.ndarray # Start foot position of limb 2
     p_3_start: jnp.ndarray # Start foot position of limb 3
     p_4_start: jnp.ndarray # Start foot position of limb 4
+    initial_base_pose: jnp.ndarray  # Initial base pose (x, y, z, roll, pitch, yaw)
+    initial_base_velocity: jnp.ndarray  # Initial base velocity (vx, vy, vz, wx, wy, wz)
 
 @dataclass
 class CurrentState: 
@@ -43,18 +45,18 @@ class CurrentState:
     p_2_meas: jnp.ndarray  # Measured foot position of limb 2
     p_3_meas: jnp.ndarray  # Measured foot position of limb 3
     p_4_meas: jnp.ndarray  # Measured foot position of limb 4
-    initial_base_pose: jnp.ndarray  # Initial base pose (x, y, z, roll, pitch, yaw)
-    initial_base_velocity: jnp.ndarray  # Initial base velocity (vx, vy, vz, wx, wy, wz)
+    current_base_pose: jnp.ndarray  # Current base pose (x, y, z, roll, pitch, yaw)
+    current_base_velocity: jnp.ndarray  # Current base velocity (vx, vy, vz, wx, wy, wz)
 
 # Register CurrentState as a pytree (all leaves are arrays)
 def _cs_flatten(cs: CurrentState):
     leaves = (cs.p_1_meas, cs.p_2_meas, cs.p_3_meas, cs.p_4_meas,
-              cs.initial_base_pose, cs.initial_base_velocity)
+              cs.current_base_pose, cs.current_base_velocity)
     return leaves, None
 def _cs_unflatten(aux, leaves):
     p1, p2, p3, p4, pose, vel = leaves
     return CurrentState(p_1_meas=p1, p_2_meas=p2, p_3_meas=p3, p_4_meas=p4,
-                        initial_base_pose=pose, initial_base_velocity=vel)
+                        current_base_pose=pose, current_base_velocity=vel)
 tree_util.register_pytree_node(CurrentState, _cs_flatten, _cs_unflatten)
 
 try:

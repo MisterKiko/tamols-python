@@ -47,20 +47,11 @@ robot = Robot(
     p_2_start=jnp.array([0.1934,-0.0465-0.0955,0.0]),
     p_3_start=jnp.array([-0.1934,0.0465+0.0955,0.0]),
     p_4_start=jnp.array([-0.1934,-0.0465-0.0955,0.0]),
-)
-
-currentstate = CurrentState(
-    p_1_meas=robot.p_1_start,
-    p_2_meas=robot.p_2_start,
-    p_3_meas=robot.p_3_start,
-    p_4_meas=robot.p_4_start,
     initial_base_pose=jnp.array([0.0, 0.0, 0.445, 0.0, 0.0, 0.0]),
     initial_base_velocity=jnp.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
 )
 
-x0 = build_initial_x0(gait, currentstate)
-
-problem = TAMOLS(x0, gait, terrain, robot, currentstate)
+problem = TAMOLS(gait, terrain, robot)
 
 sols, infos = problem.run_repeated_optimizations({
             "max_iter": 300,
