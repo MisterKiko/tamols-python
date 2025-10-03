@@ -14,6 +14,8 @@ class Gait:
     desired_base_velocity: jnp.ndarray  # Desired base velocity in world frame
     desired_base_angular_velocity: jnp.ndarray  # Desired base angular velocity in world frame
     apex_height: float # Apex height for swing leg trajectory
+    contact_schedule: jnp.ndarray = None  # Contact schedule (n_phases x 4), 1 if in contact, 0 if swing
+    at_des_position: jnp.ndarray = None  # (n_phases x 4) 1 if foot should be at desired position at the end of the phase, 0 otherwise
 
 @dataclass
 class Terrain:

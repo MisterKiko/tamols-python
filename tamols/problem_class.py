@@ -19,6 +19,7 @@ from jax import debug as jdebug
 class TAMOLS():
     def __init__(self, gait: Gait, terrain: Terrain, robot: Robot,
                  x_lb: np.ndarray = None, x_ub: np.ndarray = None):
+
         self.gait = gait
         self.terrain = terrain
         self.robot = robot
@@ -31,6 +32,48 @@ class TAMOLS():
             current_base_velocity=robot.initial_base_velocity,
         )
 
+        # --- Assertions ---
+        assert isinstance(self.gait.tau_k, (list, tuple, np.ndarray, jnp.ndarray)), \
+            "gait.tau_k must be array-like"
+        tau_k_arr = np.asarray(self.gait.tau_k)
+        assert tau_k_arr.ndim == 1, \
+            f"gait.tau_k must be 1D of length n_phases; got ndim={tau_k_arr.ndim}"
+        assert tau_k_arr.shape[0] == self.gait.n_phases, \
+            f"gait.tau_k length {tau_k_arr.shape[0]} != n_phases {self.gait.n_phases}"
+
+        for name in ("contact_schedule", "at_des_position"):
+            if not hasattr(self.gait, name):
+                raise AttributeError(f"Gait missing required attribute '{name}'")
+            arr = np.asarray(getattr(self.gait, name))
+            assert arr.shape == (self.gait.n_phases, 4), \
+                f"{name} shape {arr.shape} != ({self.gait.n_phases}, 4)"
+
+        # Precompute phases with exactly two contacts
+        cs_np = np.asarray(self.gait.contact_schedule, dtype=int)
+        two_contact_phase_idx = np.where(cs_np.sum(axis=1) == 2)[0]
+        two_contact_pairs = []
+        for ph in two_contact_phase_idx:
+            legs = np.where(cs_np[ph] == 1)[0]
+            if legs.size != 2:
+                continue  # safety
+            two_contact_pairs.append(legs)
+        self._two_contact_phases = jnp.asarray(two_contact_phase_idx, dtype=jnp.int32)
+        self._two_contact_pairs  = jnp.asarray(two_contact_pairs, dtype=jnp.int32) if two_contact_pairs else jnp.zeros((0,2), dtype=jnp.int32)
+
+        # Precompute (phase, leg_i, leg_j) for phases with >=3 contacts (for dyn_phase_ineq)
+        multi_pairs = []
+        multi_contact_phase_idx = np.where(cs_np.sum(axis=1) >= 3)[0]
+        for ph in multi_contact_phase_idx:
+            legs = np.where(cs_np[ph] == 1)[0]
+            for a in range(len(legs)):
+                for b in range(a + 1, len(legs)):
+                    multi_pairs.append([ph, legs[a], legs[b]])
+        self._multi_contact_phase_pairs = (
+            jnp.asarray(multi_pairs, dtype=jnp.int32)
+            if multi_pairs else jnp.zeros((0, 3), dtype=jnp.int32)
+        )
+
+        # Precompute heightmap gradients
         self.h_s1 = jnp.array(get_hs1(terrain.heightmap))
         self.h_s2 = jnp.array(get_hs2(terrain.heightmap))
         gxh, gyh = compute_heightmap_gradients(self.terrain.heightmap, self.terrain.grid_cell_length)
@@ -50,8 +93,6 @@ class TAMOLS():
 
         # Precompute limb centers and previous footholds
         self._limb_centers = jnp.stack([robot.r_1, robot.r_2, robot.r_3, robot.r_4])
-        #self._prev_feet = jnp.stack([current_state.p_1_meas, current_state.p_2_meas,
-        #                             current_state.p_3_meas, current_state.p_4_meas])
 
         self.T_k = gait.tau_k / 6.0  # nominal timestep per phase (s)
         # Uniform per‑phase timestep grid (use a fixed samples-per-phase)
@@ -156,7 +197,6 @@ class TAMOLS():
         a_pos = sv["a_pos"]  # (n_phases, 3, k+1)
         a_rot = sv["a_rot"]  # (n_phases, 3, k+1)
         feet = jnp.stack([sv["p_1"], sv["p_2"], sv["p_3"], sv["p_4"]])  # (4,3)
-        feet_midstance = jnp.stack([sv["p_1"], m2, m3, sv["p_4"]])  # (4,3)
         feet_prev = jnp.stack([m1, m2, m3, m4])  # (4,3)
 
         # Mid-phase pose used in some foothold costs
@@ -184,19 +224,35 @@ class TAMOLS():
 
         # Per-limb, per-phase spline costs
         phase_idx = jnp.arange(self.gait.n_phases)
+
         def limb_phase_sum(a_pos_all, a_rot_all, limb_center):
             return jnp.sum(vmap(lambda n: self._cost_of_phase(a_pos_all[n], a_rot_all[n],
                                                              self._timesteps[n], limb_center, self.T_k[n]))(phase_idx))
+        
         spline_costs = vmap(lambda lc: limb_phase_sum(a_pos, a_rot, lc))(self._limb_centers)
 
-        # Pairwise foot collision avoidance
-        pair_costs = vmap(lambda pair: w[1] * leg_collision_avoidance_cost(
-            feet[pair[0]], feet[pair[1]], self.gait.eps_min))(self._pairs)
+        # Phase‑dependent pairwise foot collision avoidance:
+        # For each phase and leg: if at_des_position==1 use current decision foot,
+        # otherwise use previous (measured) foot position.
+        at_des = jnp.asarray(self.gait.at_des_position, dtype=feet.dtype)  # (n_phases,4)
+        mask = at_des[..., None]  # (n_phases,4,1)
+        feet_cur = feet[None, :, :]          # (1,4,3)
+        feet_prev_all = feet_prev[None, :, :]  # (1,4,3)
+        feet_sel = mask * feet_cur + (1.0 - mask) * feet_prev_all  # (n_phases,4,3)
 
-        pair_costs_midstance = vmap(lambda pair: w[1] * leg_collision_avoidance_cost(
-            feet_midstance[pair[0]], feet_midstance[pair[1]], self.gait.eps_min))(self._pairs)
+        def phase_pair_cost(feet_phase):
+            return jnp.sum(vmap(
+                lambda pair: w[1] * leg_collision_avoidance_cost(
+                    feet_phase[pair[0]], feet_phase[pair[1]], self.gait.eps_min)
+            )(self._pairs))
 
-        return jnp.sum(static_costs) + jnp.sum(spline_costs) + jnp.sum(pair_costs) + jnp.sum(pair_costs_midstance) + slack_variables_cost(sv["slack_var"])
+        pair_costs_all = vmap(phase_pair_cost)(feet_sel)  # (n_phases,)
+        pair_cost_total = jnp.sum(pair_costs_all)
+
+        return (jnp.sum(static_costs)
+                + jnp.sum(spline_costs)
+                + pair_cost_total
+                + slack_variables_cost(sv["slack_var"]))
     
         # ----------------- x-only equality constraints -----------------
     def compute_eq_constraints(self, x: jnp.ndarray, cs: CurrentState) -> jnp.ndarray:
@@ -234,12 +290,25 @@ class TAMOLS():
         inertia = self.robot.inertia
         mu = self.terrain.mu
         e_z = jnp.array([0.0, 0.0, 1.0])
+        l_min, l_max = self.robot.l_min, self.robot.l_max
 
         # Coerce measured feet once
         m1 = jnp.asarray(cs.p_1_meas)
         m2 = jnp.asarray(cs.p_2_meas)
         m3 = jnp.asarray(cs.p_3_meas)
         m4 = jnp.asarray(cs.p_4_meas)
+
+        feet = jnp.stack([sv["p_1"], sv["p_2"], sv["p_3"], sv["p_4"]])  # (4,3)
+        feet_prev = jnp.stack([m1, m2, m3, m4])  # (4,3)
+        limb_centers = self._limb_centers
+
+        # For each phase and leg: if at_des_position==1 use current decision foot,
+        # otherwise use previous (measured) foot position.
+        at_des = jnp.asarray(self.gait.at_des_position, dtype=feet.dtype)  # (n_phases,4)
+        mask = at_des[..., None]  # (n_phases,4,1)
+        feet_cur = feet[None, :, :]          # (1,4,3)
+        feet_prev_all = feet_prev[None, :, :]  # (1,4,3)
+        feet_sel = mask * feet_cur + (1.0 - mask) * feet_prev_all  # (n_phases,4,3)
 
         # Simple vertical-accel constraint: a_z(t) - g_z >= 0
         def az_minus_g_phase(phase):
@@ -251,7 +320,7 @@ class TAMOLS():
             return vmap(at_t)(ts)
         az_g = jnp.concatenate([az_minus_g_phase(p) for p in range(self.gait.n_phases)])
 
-        # A) Friction cone over all phases/timesteps: mu*(-a_Bz) - ||a_Bxy|| >= 0
+        # Friction cone over all phases/timesteps: mu*(-a_Bz) - ||a_Bxy|| >= 0
         def friction_phase(phase):
             a_pos = sv["a_pos"][phase]
             ts = self._timesteps[phase]
@@ -262,71 +331,58 @@ class TAMOLS():
             return vmap(at_t)(ts)
         fric = jnp.concatenate([friction_phase(p) for p in range(self.gait.n_phases)])
 
-        # Dynamic equality constraintsfs
+        # Dynamic constraints (two-contact phases):
         g = self.terrain.gravity
         mass = self.robot.mass
         inertia = self.robot.inertia
 
-        def dyn_phase(phase, p_i, p_j):
+        def dyn_phase_eq(phase, p_i, p_j):
             a_pos, a_rot = sv["a_pos"][phase], sv["a_rot"][phase]
-            ts = jnp.array([0.0, self._timesteps[phase][-1]])
+            ts = jnp.array([self._timesteps[phase][-1]])
             p_ij = p_j - p_i
             eps = sv["slack_var"][phase]
+
             def at_t(t):
+                # Base kinematics
                 p_B    = evaluate_spline_position(a_pos, t)
                 p_B_dd = evaluate_spline_acceleration(a_pos, t)
-                a_B = g - p_B_dd
+                a_B    = g - p_B_dd  # base acceleration in world
 
+                # Orientation & angular momentum rate
                 phi_B  = evaluate_spline_position(a_rot, t)
-                phi_d = evaluate_spline_velocity(a_rot, t)
+                phi_d  = evaluate_spline_velocity(a_rot, t)
                 phi_dd = evaluate_spline_acceleration(a_rot, t)
                 L_B_dot = angular_momentum_dot_world_from_euler_xyz(phi_B, phi_d, phi_dd, inertia)
+
+                # Original dynamic line constraint (intended ~ 0)
                 con_dyn = jnp.dot(p_ij, L_B_dot) - mass * scalar_triple_product(p_ij, p_B - p_i, a_B)
-                return jnp.array([con_dyn + eps, -con_dyn + eps])
 
-            return vmap(at_t)(ts)
-
-        # Use measured feet in phase 0, decision feet in phase 2
-        if self.gait.n_phases >= 3:
-            c1 = dyn_phase(0, m2, m3)
-            c2 = dyn_phase(2, sv["p_1"], sv["p_4"])
-            dyn_eq = jnp.concatenate([c1.reshape(-1), c2.reshape(-1)])
-        else:
-            dyn_eq = jnp.zeros((0,), dtype=sv["p_1"].dtype)
-
-
-        # B) Extra “moment” constraints for phases 0 and 2 (needs to be updated if gait changes)
-        def extra_phase(phase, p_i, p_j, eps):
-            a_pos, a_rot = sv["a_pos"][phase], sv["a_rot"][phase]
-            ts = jnp.array([0.0, self._timesteps[phase][-1]])
-            p_ij = p_j - p_i
-            def at_t(t):
-                p_B    = evaluate_spline_position(a_pos, t)
-                p_B_dd = evaluate_spline_acceleration(a_pos, t)
-                phi_B  = evaluate_spline_position(a_rot, t)
-                phi_d = evaluate_spline_velocity(a_rot, t)
-                phi_dd = evaluate_spline_acceleration(a_rot, t)
-                L_B_dot = angular_momentum_dot_world_from_euler_xyz(phi_B, phi_d, phi_dd, inertia)
-                a_B = g - p_B_dd
+                # Inlined former extra_phase (moment) constraint
+                # M_i = ( (p_B - p_i) x a_B ) - L_B_dot / mass
                 M_i = jnp.cross((p_B - p_i), a_B) - L_B_dot / mass
-                return scalar_triple_product(e_z, p_ij, M_i) + eps
+                moment_val = scalar_triple_product(e_z, p_ij, M_i)  # want >= -eps
+
+                # Pack: [con_dyn + eps >= 0, -con_dyn + eps >= 0, moment_val + eps >= 0]
+                return jnp.array([con_dyn + eps, -con_dyn + eps, moment_val + eps])
+
             return vmap(at_t)(ts)
 
-        extras = []
-        if self.gait.n_phases >= 1:
-            extras.append(extra_phase(0, m2, m3, sv["slack_var"][0]))
-        if self.gait.n_phases >= 3:
-            extras.append(extra_phase(2, sv["p_1"], sv["p_4"], sv["slack_var"][2]))
-        extra_all = jnp.concatenate(extras) if extras else jnp.zeros((0,), dtype=sv["p_1"].dtype)
+        dyn_eq_list = []
+        for k in range(int(self._two_contact_phases.shape[0])):
+            ph = self._two_contact_phases[k].astype(int)
+            legs = self._two_contact_pairs[k]
+            i, j = legs[0].astype(int), legs[1].astype(int)
+            p_i = feet_sel[ph, i]
+            p_j = feet_sel[ph, j]
+            dyn_eq_list.append(dyn_phase_eq(ph, p_i, p_j).reshape(-1))
+        dyn_eq = jnp.concatenate(dyn_eq_list) if dyn_eq_list else jnp.zeros((0,), dtype=feet.dtype)
 
-        def dyn_phase_17b(pair, phase):
-            i , j = pair
-            foot_positions = jnp.stack([sv["p_1"], m2, m3, sv["p_4"]])
-            p_i, p_j = foot_positions[i], foot_positions[j]
+        def dyn_phase_ineq(phase, p_i, p_j):
             a_pos, a_rot = sv["a_pos"][phase], sv["a_rot"][phase]
-            ts = jnp.array([0.0, self._timesteps[phase][-1]])
+            ts = jnp.array([self._timesteps[phase][-1]])
             p_ij = p_j - p_i
             eps = sv["slack_var"][phase]
+
             def at_t(t):
                 p_B    = evaluate_spline_position(a_pos, t)
                 p_B_dd = evaluate_spline_acceleration(a_pos, t)
@@ -341,9 +397,19 @@ class TAMOLS():
 
             return vmap(at_t)(ts)
         
-        dyn_ineq = vmap(lambda pair: dyn_phase_17b(pair, 1))(self._pairs).reshape(-1)
+        dyn_ineq_list = []
+        # Apply dyn_phase_ineq ONLY to phases with >=3 contacts, for every contact leg pair
+        for idx in range(int(self._multi_contact_phase_pairs.shape[0])):
+            ph = self._multi_contact_phase_pairs[idx, 0].astype(int)    
+            i  = self._multi_contact_phase_pairs[idx, 1].astype(int)
+            j  = self._multi_contact_phase_pairs[idx, 2].astype(int)
+            p_i = feet_sel[ph, i]
+            p_j = feet_sel[ph, j]
+            dyn_ineq_list.append(dyn_phase_ineq(ph, p_i, p_j).reshape(-1))
+        dyn_ineq = (jnp.concatenate(dyn_ineq_list)
+                    if dyn_ineq_list else jnp.zeros((0,), dtype=feet.dtype))
 
-        # C) Convex GIAC (two stance configs)
+        # Convex GIAC (per phase, using at_des-based selected feet)
         def giac_block(p1, p2, p3, p4):
             p_12, p_13, p_14 = p2 - p1, p3 - p1, p4 - p1
             p_21, p_23, p_24 = p1 - p2, p3 - p2, p4 - p2
@@ -355,16 +421,10 @@ class TAMOLS():
                 jnp.dot(jnp.cross(p_21, p_24), e_z),
             ])
 
-        # Use consistent order [p1(FL), p2(FR), p4(RR), p3(RL)]
-        c_giac_1 = giac_block(sv["p_1"], m2, sv["p_4"], m3)
-        c_giac_2 = giac_block(sv["p_1"], sv["p_2"], sv["p_4"], sv["p_3"])
-        giac = jnp.concatenate([c_giac_1, c_giac_2])
+        giac_per_phase = vmap(lambda f: giac_block(f[0], f[1], f[3], f[2]))(feet_sel)  # (n_phases,4)
+        giac = giac_per_phase.reshape(-1)
 
-        # D) Kinematic leg-length bounds per phase/timestep/leg
-        feet = jnp.stack([sv["p_1"], sv["p_2"], sv["p_3"], sv["p_4"]])
-        limb_centers = self._limb_centers
-        l_min, l_max = self.robot.l_min, self.robot.l_max
-
+        # Kinematic leg-length bounds per phase/timestep/leg
         def kin_phase(phase):
             a_pos = sv["a_pos"][phase]
             a_rot = sv["a_rot"][phase]
@@ -381,10 +441,10 @@ class TAMOLS():
             return vmap(at_t)(ts).reshape(-1)
         kin = jnp.concatenate([kin_phase(p) for p in range(self.gait.n_phases)])
 
-        # E) Slack vars >= 0
+        # Slack vars >= 0
         slack_var_constr = sv["slack_var"]  # (n_phases,)
 
-        return jnp.concatenate([fric, kin, az_g, slack_var_constr, extra_all, giac, dyn_eq, dyn_ineq])
+        return jnp.concatenate([fric, kin, az_g, slack_var_constr, giac, dyn_eq, dyn_ineq])
     
     # ============== Ipopt callbacks ==============
     def objective(self, x):
