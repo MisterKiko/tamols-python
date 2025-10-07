@@ -199,26 +199,21 @@ class TAMOLS():
         feet = jnp.stack([sv["p_1"], sv["p_2"], sv["p_3"], sv["p_4"]])  # (4,3)
         feet_prev = jnp.stack([m1, m2, m3, m4])  # (4,3)
 
-        # Mid-phase pose used in some foothold costs
-        mid_phase = int(self.gait.n_phases // 2)
-        ts_mid = self._timesteps[mid_phase]
-        t_mid = ts_mid[ts_mid.shape[0] // 2]
-        p_B_mid = evaluate_spline_position(a_pos[mid_phase], t_mid)
-        phi_B_mid = evaluate_spline_position(a_rot[mid_phase], t_mid)
-        R_B_mid = euler_xyz_to_matrix(phi_B_mid)
-
         w = self.gait.weights
-    
+
+        # End-of-phase pose used in some foothold costs
+        p_B_end = evaluate_spline_position(a_pos[-1], self.gait.tau_k[-1])
+        phi_B_end = evaluate_spline_position(a_rot[-1], self.gait.tau_k[-1])
+        R_B_end = euler_xyz_to_matrix(phi_B_end)
 
         # Per-limb "static" foothold costs
         def limb_static_cost(foot, limb_center, prev_foot):
             c1 = w[0] * foothold_on_ground_cost(foot, self.terrain.heightmap, self.terrain.grid_cell_length)
-            c3 = w[2] * nominal_kinematics_cost(p_B_mid, foot, self.gait.h_des, limb_center, R_B_mid)
             c5 = w[4] * edge_avoidance_cost(self.grad_h_x, self.grad_h_y,
                                             self.grad_h_s1_x, self.grad_h_s1_y,
                                             foot, self.terrain.grid_cell_length)
             c6 = w[5] * previous_solution_cost(foot, prev_foot)
-            return c1 + c3 + c5 + c6
+            return c1 + c5 + c6
 
         static_costs = vmap(limb_static_cost)(feet, self._limb_centers, feet_prev)
 
@@ -231,14 +226,29 @@ class TAMOLS():
         
         spline_costs = vmap(lambda lc: limb_phase_sum(a_pos, a_rot, lc))(self._limb_centers)
 
-        # Phase‑dependent pairwise foot collision avoidance:
-        # For each phase and leg: if at_des_position==1 use current decision foot,
-        # otherwise use previous (measured) foot position.
+        # Select feet per phase based on at_des_position (1 -> current decision foot, 0 -> previous/measured)
         at_des = jnp.asarray(self.gait.at_des_position, dtype=feet.dtype)  # (n_phases,4)
-        mask = at_des[..., None]  # (n_phases,4,1)
-        feet_cur = feet[None, :, :]          # (1,4,3)
-        feet_prev_all = feet_prev[None, :, :]  # (1,4,3)
+        mask = at_des[..., None]                       # (n_phases,4,1)
+        feet_cur = feet[None, :, :]                    # (1,4,3)
+        feet_prev_all = feet_prev[None, :, :]          # (1,4,3)
         feet_sel = mask * feet_cur + (1.0 - mask) * feet_prev_all  # (n_phases,4,3)
+
+        # Nominal kinematics at mid‑phase for stance legs only
+        contact = jnp.asarray(self.gait.contact_schedule, dtype=feet.dtype)  # (n_phases,4)
+
+        def kin_mid_phase(a_pos_n, a_rot_n, timesteps_n, feet_n, contact_n):
+            t_mid = 0.5 * timesteps_n[-1]  # tau_k/2
+            p_B_mid = evaluate_spline_position(a_pos_n, t_mid)
+            phi_mid = evaluate_spline_position(a_rot_n, t_mid)
+            R_mid = euler_xyz_to_matrix(phi_mid)
+            per_leg = vmap(lambda f, lc: nominal_kinematics_cost(
+                p_B_mid, f, self.gait.h_des, lc, R_mid
+            ))(feet_n, self._limb_centers)  # (4,)
+            return w[2] * jnp.sum(per_leg * contact_n)
+
+        kin_mid_total = jnp.sum(vmap(kin_mid_phase)(
+            a_pos, a_rot, self._timesteps, feet_sel, contact
+        ))
 
         def phase_pair_cost(feet_phase):
             return jnp.sum(vmap(
@@ -251,6 +261,7 @@ class TAMOLS():
 
         return (jnp.sum(static_costs)
                 + jnp.sum(spline_costs)
+                + kin_mid_total
                 + pair_cost_total
                 + slack_variables_cost(sv["slack_var"]))
     

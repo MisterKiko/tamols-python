@@ -5,6 +5,7 @@ from .map_processing import (
     get_hs1,
     get_hs2,
     save_heightmap_to_png,
+    show_map
 )
 from .helpers import (
     euler_xyz_to_matrix,
@@ -25,7 +26,6 @@ from .manual_heightmaps import (
 
 from .plot_sol import plot_all_iterations
 from .trajectory import get_trajectory_function
-from .map_test import show_map
 
 __all__ = [
     'TAMOLS', 'build_initial_x0', 'update_state_from_solution',
@@ -35,5 +35,5 @@ __all__ = [
     'get_flat_heightmap', 'get_rough_terrain_heightmap', 'get_stairs_heightmap',
     'Gait', 'Terrain', 'Robot', 'CurrentState',
     'plot_all_iterations', 'get_trajectory_function',
-    'show_map', 'save_heightmap_to_png',
+    'show_map', 'save_heightmap_to_png', 
 ]

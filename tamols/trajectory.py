@@ -34,8 +34,12 @@ def get_trajectory_function(results: list, problem: TAMOLS):
 
     gait = problem.gait
     tau_k = np.asarray(gait.tau_k, dtype=float)
-    step_duration = float(np.sum(tau_k))
+    n_phases = int(tau_k.shape[0])
+    phase_ends = np.cumsum(tau_k)  # cumulative phase end times within a step
+    step_duration = float(phase_ends[-1])
     apex_height = float(getattr(gait, "apex_height", 0.1))
+    # Feet scheduled to land at desired in each phase (n_phases,4) with 0/1 flags
+    at_des = np.asarray(getattr(gait, "at_des_position", np.zeros((n_phases, 4))), dtype=int)
 
     # Initial (previous) step foot positions
     feet_prev = np.array([
@@ -66,13 +70,12 @@ def get_trajectory_function(results: list, problem: TAMOLS):
         a_pos = sv["a_pos"]  # (n_phases, 3, order+1)
         a_rot = sv["a_rot"]  # (n_phases, 3, order+1)
 
-        # Swing splines (assumes 3-phase pattern: phase 0 legs (0,3), phase 2 legs (1,2))
-        splines = {
-            (0, 0): _build_leg_spline(feet_prev[0], feet_next[0], apex_height),
-            (0, 3): _build_leg_spline(feet_prev[3], feet_next[3], apex_height),
-            (2, 1): _build_leg_spline(feet_prev[1], feet_next[1], apex_height),
-            (2, 2): _build_leg_spline(feet_prev[2], feet_next[2], apex_height),
-        }
+        # Swing splines for any (phase, leg) where at_des[phase, leg] == 1
+        splines = {}
+        for ph in range(n_phases):
+            for leg in range(4):
+                if at_des[ph, leg] == 1:
+                    splines[(ph, leg)] = _build_leg_spline(feet_prev[leg], feet_next[leg], apex_height)
 
         step_defs.append({
             "t_start": t_cursor,
@@ -120,26 +123,39 @@ def get_trajectory_function(results: list, problem: TAMOLS):
             else:
                 step = next(sd for sd in step_defs if sd["t_start"] <= t < sd["t_end"])
             local_t = t - step["t_start"]
-            if local_t < tau_k[0]:
-                phase = 0; phase_t = local_t; phase_dur = tau_k[0]
-            elif local_t < tau_k[0] + tau_k[1]:
-                phase = 1; phase_t = local_t - tau_k[0]; phase_dur = tau_k[1]
+
+            # Generic phase mapping for any number of phases using cumulative sums
+            idx = int(np.searchsorted(phase_ends, local_t, side='right'))
+            phase = min(idx, n_phases - 1)
+            phase_start = 0.0 if phase == 0 else float(phase_ends[phase - 1])
+            phase_dur = float(tau_k[phase])
+            phase_t = float(local_t - phase_start)
+
+            # Legs that already landed in any earlier phase of THIS step stay at p_end
+            if phase > 0:
+                landed_before = np.any(at_des[:phase, :] == 1, axis=0)  # (4,)
+                for leg in range(4):
+                    if landed_before[leg]:
+                        feet[leg] = step["p_end"][leg]
             else:
-                phase = 2; phase_t = local_t - tau_k[0] - tau_k[1]; phase_dur = tau_k[2]
+                landed_before = np.zeros(4, dtype=bool)
 
             # Feet (reuse existing logic)
             feet = step["p_start"].copy()
+            # Legs that landed in earlier phases stay at p_end
             if phase > 0:
-                feet[0] = step["p_end"][0]
-                feet[3] = step["p_end"][3]
+                for leg in range(4):
+                    if np.any(at_des[:phase, leg] == 1):
+                        feet[leg] = step["p_end"][leg]
             s_norm = (phase_t / phase_dur) if phase_dur > 0 else 0.0
             s_norm = float(min(max(s_norm, 0.0), 1.0))
-            for k in [(phase, 0), (phase, 1), (phase, 2), (phase, 3)]:
-                if k in step["splines"]:
-                    feet[k[1]] = step["splines"][k](s_norm)
-            if phase == 2 and s_norm >= 0.999:
-                feet[1] = step["p_end"][1]
-                feet[2] = step["p_end"][2]
+            for leg in range(4):
+                key = (phase, leg)
+                if key in step["splines"] and not landed_before[leg]:
+                    feet[leg] = step["splines"][key](s_norm)
+                    # Snap to end at the tail of the phase to avoid tiny drift
+                    if s_norm >= 0.999:
+                        feet[leg] = step["p_end"][leg]
 
             # Base position / rotation (evaluate spline coeffs)
             # phase_t is time within phase
