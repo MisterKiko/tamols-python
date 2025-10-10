@@ -6,7 +6,7 @@ from tamols.manual_heightmaps import get_flat_heightmap, get_rough_terrain_heigh
 from tamols.map_processing import save_heightmap_to_png, show_map
 
 gait = Gait(
-    n_steps=8,
+    n_steps=6,
     n_phases=2,
     spline_order=5,
     tau_k=jnp.array([0.5, 0.5]), # Time duration of phases [s]
@@ -27,8 +27,8 @@ gait = Gait(
 )
 
 # h = jnp.array(get_flat_heightmap(a=300, b=300, height=0.0))  # Flat heightmap for testing
-h = jnp.array(get_rough_terrain_heightmap(a=350, b=350, sigma=0.02, platform_height=0.0, platform_size=5, smooth_sigma=3, seed=917)) # Heightmap with platforms
-# h = jnp.array(get_stairs_heightmap(a=300, b=300, start_col=200, step_depth=30, step_height=0.05))  # Heightmap with stairs
+# h = jnp.array(get_rough_terrain_heightmap(a=400, b=400, sigma=0.04, platform_height=0.0, platform_size=5, smooth_sigma=3, seed=917)) # Heightmap with platforms
+h = jnp.array(get_stairs_heightmap(a=300, b=300, start_col=200, step_depth=30, step_height=0.05))  # Heightmap with stairs
 
 
 terrain = Terrain(
@@ -62,7 +62,8 @@ robot = Robot(
 
 problem = TAMOLS(gait, terrain, robot)
 
-sols, infos = problem.run_repeated_optimizations({
+sols, infos = problem.run_repeated_optimizations(warm_start=True, options=
+        {
             "max_iter": 300,
             "acceptable_tol": 1e-3
         })

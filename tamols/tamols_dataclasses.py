@@ -49,17 +49,19 @@ class CurrentState:
     p_4_meas: jnp.ndarray  # Measured foot position of limb 4
     current_base_pose: jnp.ndarray  # Current base pose (x, y, z, roll, pitch, yaw)
     current_base_velocity: jnp.ndarray  # Current base velocity (vx, vy, vz, wx, wy, wz)
+    # Use virtual floor (h_s2) for foothold costs when True; real heightmap when False
+    use_virtual_floor: jnp.ndarray
 
 # Register CurrentState as a pytree (all leaves are arrays)
 def _cs_flatten(cs: CurrentState):
     leaves = (cs.p_1_meas, cs.p_2_meas, cs.p_3_meas, cs.p_4_meas,
-              cs.current_base_pose, cs.current_base_velocity)
+              cs.current_base_pose, cs.current_base_velocity, cs.use_virtual_floor)
     return leaves, None
 def _cs_unflatten(aux, leaves):
-    p1, p2, p3, p4, pose, vel = leaves
+    p1, p2, p3, p4, pose, vel, use_vf = leaves
     return CurrentState(p_1_meas=p1, p_2_meas=p2, p_3_meas=p3, p_4_meas=p4,
-                        current_base_pose=pose, current_base_velocity=vel)
-tree_util.register_pytree_node(CurrentState, _cs_flatten, _cs_unflatten)
+                        current_base_pose=pose, current_base_velocity=vel,
+                        use_virtual_floor=use_vf)
 
 try:
     tree_util.register_pytree_node(CurrentState, _cs_flatten, _cs_unflatten)

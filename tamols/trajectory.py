@@ -4,7 +4,7 @@ from .helpers import *
 from .tamols_dataclasses import *
 from .problem_class import TAMOLS
 
-def _build_leg_spline(p_start: np.ndarray, p_end: np.ndarray, apex_height: float):
+def _build_leg_spline(p_start: np.ndarray, p_end: np.ndarray, apex_height: float, heightmap: np.ndarray, grid_cell_length: float):
     line_vec = p_end - p_start
     z_axis = np.array([0.0, 0.0, 1.0])
     # Handle degeneracy (zero or vertical line)
@@ -15,6 +15,11 @@ def _build_leg_spline(p_start: np.ndarray, p_end: np.ndarray, apex_height: float
         normal = np.cross(np.cross(line_vec, z_axis), line_vec)
         normal /= np.linalg.norm(normal)
     s = apex_height * normal + 0.5 * (p_start + p_end)
+    h = bilinear_interp(heightmap, s, grid_cell_length)
+    index = 1
+    while s[2] < h:
+        index += 1
+        s = apex_height * index * normal + 0.5 * (p_start + p_end)
     t_knots = np.array([0.0, 0.5, 1.0])  # normalized time within phase
     pts = np.vstack([p_start, s, p_end])
     return CubicSpline(t_knots, pts, axis=0)
@@ -26,7 +31,7 @@ def get_trajectory_function(results: list, problem: TAMOLS):
         times:    (N,)
         feet_pos: (N, 4, 3)
         base_pos: (N, 3)
-         base_rot: (N, 3) Euler XYZ angles
+        base_rot: (N, 3) Euler XYZ angles
     """
 
     if not results:
@@ -75,7 +80,9 @@ def get_trajectory_function(results: list, problem: TAMOLS):
         for ph in range(n_phases):
             for leg in range(4):
                 if at_des[ph, leg] == 1:
-                    splines[(ph, leg)] = _build_leg_spline(feet_prev[leg], feet_next[leg], apex_height)
+                    splines[(ph, leg)] = _build_leg_spline(feet_prev[leg], feet_next[leg], apex_height,
+                                                           problem.terrain.heightmap,
+                                                           problem.terrain.grid_cell_length)
 
         step_defs.append({
             "t_start": t_cursor,
@@ -131,29 +138,26 @@ def get_trajectory_function(results: list, problem: TAMOLS):
             phase_dur = float(tau_k[phase])
             phase_t = float(local_t - phase_start)
 
+            # Start from step start feet
+            feet = step["p_start"].copy()
+
             # Legs that already landed in any earlier phase of THIS step stay at p_end
             if phase > 0:
                 landed_before = np.any(at_des[:phase, :] == 1, axis=0)  # (4,)
-                for leg in range(4):
-                    if landed_before[leg]:
-                        feet[leg] = step["p_end"][leg]
             else:
                 landed_before = np.zeros(4, dtype=bool)
 
-            # Feet (reuse existing logic)
-            feet = step["p_start"].copy()
-            # Legs that landed in earlier phases stay at p_end
-            if phase > 0:
-                for leg in range(4):
-                    if np.any(at_des[:phase, leg] == 1):
-                        feet[leg] = step["p_end"][leg]
-            s_norm = (phase_t / phase_dur) if phase_dur > 0 else 0.0
+            for leg in range(4):
+                if landed_before[leg]:
+                    feet[leg] = step["p_end"][leg]
+
+            # Swing legs in current phase follow their spline, but only if they haven't landed before
+            s_norm = (phase_t / phase_dur) if phase_dur > 0.0 else 0.0
             s_norm = float(min(max(s_norm, 0.0), 1.0))
             for leg in range(4):
                 key = (phase, leg)
                 if key in step["splines"] and not landed_before[leg]:
                     feet[leg] = step["splines"][key](s_norm)
-                    # Snap to end at the tail of the phase to avoid tiny drift
                     if s_norm >= 0.999:
                         feet[leg] = step["p_end"][leg]
 

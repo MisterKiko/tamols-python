@@ -14,7 +14,7 @@ from .helpers import (
     scalar_triple_product,
     angular_momentum_dot_world_from_euler_xyz
 )
-from jax import debug as jdebug
+import time
 
 class TAMOLS():
     def __init__(self, gait: Gait, terrain: Terrain, robot: Robot,
@@ -30,6 +30,7 @@ class TAMOLS():
             p_4_meas=robot.p_4_start,
             current_base_pose=robot.initial_base_pose,
             current_base_velocity=robot.initial_base_velocity,
+            use_virtual_floor=jnp.array(False),
         )
 
         # --- Assertions ---
@@ -82,6 +83,15 @@ class TAMOLS():
         self.grad_h_y = jnp.array(gyh)
         self.grad_h_s1_x = jnp.array(gx1)
         self.grad_h_s1_y = jnp.array(gy1)
+
+        # Virtual-floor gradients (for warm start)
+        gx2, gy2 = compute_heightmap_gradients(self.h_s2, self.terrain.grid_cell_length)
+        h_s1_vf = jnp.array(get_hs1(self.h_s2))
+        gx1_vf, gy1_vf = compute_heightmap_gradients(h_s1_vf, self.terrain.grid_cell_length)
+        self.grad_h2_x = jnp.array(gx2)
+        self.grad_h2_y = jnp.array(gy2)
+        self.grad_h_s1_vf_x = jnp.array(gx1_vf)
+        self.grad_h_s1_vf_y = jnp.array(gy1_vf)
 
         # Decision vector and bounds
         x0 = build_initial_x0(gait, self.current_state)
@@ -198,24 +208,28 @@ class TAMOLS():
         a_rot = sv["a_rot"]  # (n_phases, 3, k+1)
         feet = jnp.stack([sv["p_1"], sv["p_2"], sv["p_3"], sv["p_4"]])  # (4,3)
         feet_prev = jnp.stack([m1, m2, m3, m4])  # (4,3)
-
         w = self.gait.weights
 
-        # End-of-phase pose used in some foothold costs
-        p_B_end = evaluate_spline_position(a_pos[-1], self.gait.tau_k[-1])
-        phi_B_end = evaluate_spline_position(a_rot[-1], self.gait.tau_k[-1])
-        R_B_end = euler_xyz_to_matrix(phi_B_end)
+        # Select foothold heightmap by cs.use_virtual_floor (no re-JIT needed)
+        hmap_real = jnp.asarray(self.terrain.heightmap)
+        hmap = jnp.where(cs.use_virtual_floor, self.h_s2, hmap_real)
+
+        # Select gradient fields based on use_virtual_floor
+        grad_h_x   = jnp.where(cs.use_virtual_floor, self.grad_h2_x,        self.grad_h_x)
+        grad_h_y   = jnp.where(cs.use_virtual_floor, self.grad_h2_y,        self.grad_h_y)
+        grad_h1_x  = jnp.where(cs.use_virtual_floor, self.grad_h_s1_vf_x,   self.grad_h_s1_x)
+        grad_h1_y  = jnp.where(cs.use_virtual_floor, self.grad_h_s1_vf_y,   self.grad_h_s1_y)
 
         # Per-limb "static" foothold costs
-        def limb_static_cost(foot, limb_center, prev_foot):
-            c1 = w[0] * foothold_on_ground_cost(foot, self.terrain.heightmap, self.terrain.grid_cell_length)
-            c5 = w[4] * edge_avoidance_cost(self.grad_h_x, self.grad_h_y,
-                                            self.grad_h_s1_x, self.grad_h_s1_y,
+        def limb_static_cost(foot, prev_foot):
+            c1 = w[0] * foothold_on_ground_cost(foot, hmap, self.terrain.grid_cell_length)
+            c5 = w[4] * edge_avoidance_cost(grad_h_x, grad_h_y,
+                                            grad_h1_x, grad_h1_y,
                                             foot, self.terrain.grid_cell_length)
             c6 = w[5] * previous_solution_cost(foot, prev_foot)
             return c1 + c5 + c6
 
-        static_costs = vmap(limb_static_cost)(feet, self._limb_centers, feet_prev)
+        static_costs = vmap(limb_static_cost)(feet, feet_prev)
 
         # Per-limb, per-phase spline costs
         phase_idx = jnp.arange(self.gait.n_phases)
@@ -455,7 +469,7 @@ class TAMOLS():
         # Slack vars >= 0
         slack_var_constr = sv["slack_var"]  # (n_phases,)
 
-        return jnp.concatenate([fric, kin, az_g, slack_var_constr, giac, dyn_eq, dyn_ineq])
+        return jnp.concatenate([fric, kin, az_g, slack_var_constr, giac, dyn_ineq])
     
     # ============== Ipopt callbacks ==============
     def objective(self, x):
@@ -515,27 +529,54 @@ class TAMOLS():
             nlp.add_option(k, v)
         x_sol, info = nlp.solve(np.asarray(x0, dtype=float))
         return x_sol, info
-    
-    def run_repeated_optimizations(self, options: dict | None = None):
+
+    def run_repeated_optimizations(self, warm_start: bool = True, options: dict | None = None):
         n_steps = int(self.gait.n_steps)
         sols, infos = [], []
         x_curr = np.asarray(self.x0, dtype=float)
         print("Setting up optimization...")
 
+        t0_total = time.perf_counter()
+        opt_times = []
+
         for k in range(n_steps):
             self.x0 = x_curr
-            x_sol, info = self.run_single_optimization(options)
-            sols.append(x_sol); infos.append(info)
+            step_opt_time = 0.0
 
-            # Report only final objective per run
+            if warm_start:
+                # Virtual-floor warm start (no re-JIT needed)
+                self.current_state.use_virtual_floor = jnp.array(False)  # set True if you want warm-start on h_s2
+                t_ws0 = time.perf_counter()
+                x_ws, info_ws = self.run_single_optimization(options)
+                step_opt_time += time.perf_counter() - t_ws0
+                self.x0 = np.asarray(x_ws, dtype=float)
+
+            # Main solve on real terrain
+            self.current_state.use_virtual_floor = jnp.array(False)
+            t_main0 = time.perf_counter()
+            x_sol, info = self.run_single_optimization(options)
+            step_opt_time += time.perf_counter() - t_main0
+            opt_times.append(step_opt_time)
+
+            sols.append(x_sol); infos.append(info)
             final_obj = self.objective(x_sol)
             print(f"Optimization {k+1}/{n_steps}: objective = {final_obj:.6f}")
 
             sv_sol = self._unravel(jnp.asarray(x_sol))
             next_state = update_state_from_solution(self, sv_sol)
             self.current_state = next_state  # just update; no re-JIT needed
-
             x_curr = np.asarray(build_initial_x0(self.gait, next_state), dtype=float)
+
+        # Exclude the very first timing entry from totals/averaging
+        timed = opt_times[1:] if len(opt_times) > 1 else []
+        total_opt = float(sum(timed))
+        steps_counted = len(timed)
+        avg_opt = (total_opt / steps_counted) if steps_counted > 0 else 0.0
+        wall = time.perf_counter() - t0_total
+
+        print("Note: excluded the first optimization time from totals/average.")
+        print(f"Total optimization time: {total_opt:.3f} s (avg per step: {avg_opt:.3f} s over {steps_counted} steps)")
+        print(f"Total wall-clock time (incl. setup): {wall:.3f} s")
 
         return sols, infos
  
@@ -559,6 +600,7 @@ def update_state_from_solution(problem: TAMOLS, sv_sol):
         p_4_meas=p4m, 
         current_base_pose=jnp.concatenate([p_end, r_end]),
         current_base_velocity=jnp.concatenate([v_end, w_end]),
+        use_virtual_floor=jnp.array(False),
     )
 
 
@@ -568,8 +610,8 @@ def build_initial_x0(gait: Gait, state: CurrentState) -> np.ndarray:
     # Seed constant terms with initial base pose/orientation for every phase
     a_pos = a_pos.at[:, :, 0].set(state.current_base_pose[:3])
     a_rot = a_rot.at[:, :, 0].set(state.current_base_pose[3:])
-    #a_pos = a_pos.at[:, :, 1].set(state.current_base_velocity[:3])
-    #a_rot = a_rot.at[:, :, 1].set(state.current_base_velocity[3:])
+    a_pos = a_pos.at[:, :, 1].set(state.current_base_velocity[:3])
+    a_rot = a_rot.at[:, :, 1].set(state.current_base_velocity[3:])
 
     tpl = {
         "a_pos": a_pos,
