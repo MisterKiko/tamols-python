@@ -70,3 +70,38 @@ def get_stairs_heightmap(a=150, b=150, step_height=0.05, step_depth=25, step_wid
         heightmap[row_start:row_end, col_start:col_end] = step_height * (step + 1)
 
     return heightmap
+
+def get_heightmap_ramp(a=150, b=150, ramp_height=0.5, ramp_depth=100, ramp_width=None, start_col=0):
+    """
+    Generate a heightmap representing a linear ramp rising in the x direction (columns).
+    a: number of rows
+    b: number of columns
+    ramp_height: final height at the end of the ramp (meters)
+    ramp_depth: number of columns over which the ramp rises
+    ramp_width: width of the ramp in rows; defaults to full height (a)
+    start_col: column index where the ramp starts
+    Returns a 2D numpy array (a, b).
+    """
+    if ramp_width is None:
+        ramp_width = a  # Full height by default
+
+    heightmap = np.zeros((a, b), dtype=float)
+
+    # Clamp ramp region to map bounds
+    col_start = max(0, int(start_col))
+    col_end = min(int(start_col + ramp_depth), b)
+    if col_start >= b or col_start >= col_end:
+        return heightmap  # nothing to draw
+
+    # Center the ramp in rows
+    row_start = max(0, (a - int(ramp_width)) // 2)
+    row_end = min(a, row_start + int(ramp_width))
+
+    # Linear rise from 0 to ramp_height across [col_start, col_end)
+    n_cols = col_end - col_start
+    ramp_profile = np.linspace(0.0, float(ramp_height), n_cols, endpoint=True)
+
+    for j in range(col_start, col_end):
+        heightmap[row_start:row_end, j] = ramp_profile[j - col_start]
+
+    return heightmap

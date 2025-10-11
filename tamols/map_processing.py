@@ -54,6 +54,21 @@ def get_hs2(h_raw, median_kernel=25, dilation_kernel=25, sigma=5.0, limit=0.05):
 
     return h_s2
 
+def get_laplacian(h: np.ndarray, grid_cell_length: float) -> np.ndarray:
+    """
+    Compute the Laplacian of the heightmap using finite differences.
+    Args:
+        h: 2D heightmap array
+        grid_cell_length: Length of each grid cell in the heightmap
+    Returns:
+        laplacian: 2D array of the same shape as h representing the Laplacian
+    """
+    kernel = np.array([[0, 1, 0],
+                       [1, -4, 1],
+                       [0, 1, 0]]) / (grid_cell_length ** 2)
+    
+    laplacian = ndimage.convolve(h, kernel, mode='nearest')
+    return laplacian
 
 def save_heightmap_to_png(heightmap, filepath, vmin=None, vmax=None, invert=False, ensure_parent=True):
     """Save a 2D heightmap array as an 8-bit grayscale PNG (black=low, white=high).

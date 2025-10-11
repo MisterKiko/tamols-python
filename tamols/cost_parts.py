@@ -49,8 +49,8 @@ def base_pose_alignment_cost(p_B, h_des, r_B, R_B, h_s2, grid_cell_length):
         return: cost of base pose alignment
     """
     l_des = jnp.array([0.0, 0.0, h_des])    
-    h = bilinear_interp(h_s2, p_B, grid_cell_length)
-    # Align base height to virtual floor + desired height
+    h = bilinear_interp(h_s2, p_B + R_B @ r_B, grid_cell_length)
+    # Align base with virtual floor
     return jnp.square((p_B + R_B @ r_B - l_des)[2] - h)
 
 def edge_avoidance_cost(grad_h_x, grad_h_y, grad_h_s1_x, grad_h_s1_y, p, grid_cell_length):

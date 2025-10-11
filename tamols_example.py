@@ -2,14 +2,14 @@ import jax.numpy as jnp
 from tamols.tamols_dataclasses import Gait, Terrain, Robot
 from tamols import TAMOLS, plot_all_iterations, get_trajectory_function
 from tamols.helpers import transform_inertia
-from tamols.manual_heightmaps import get_flat_heightmap, get_rough_terrain_heightmap, get_stairs_heightmap
+from tamols.manual_heightmaps import get_flat_heightmap, get_rough_terrain_heightmap, get_stairs_heightmap, get_heightmap_ramp
 from tamols.map_processing import save_heightmap_to_png, show_map
 
 gait = Gait(
-    n_steps=6,
+    n_steps=10,
     n_phases=2,
     spline_order=5,
-    tau_k=jnp.array([0.5, 0.5]), # Time duration of phases [s]
+    tau_k=jnp.array([1.0, 1.0]), # Time duration of phases [s]
     h_des=0.445,
     eps_min=0.1,
     weights = jnp.array([10.0e4, 0.001, 7.0, 100.0, 3.0, 0.01, 2.0, 0.001]),
@@ -26,14 +26,16 @@ gait = Gait(
     ])
 )
 
-# h = jnp.array(get_flat_heightmap(a=300, b=300, height=0.0))  # Flat heightmap for testing
-# h = jnp.array(get_rough_terrain_heightmap(a=400, b=400, sigma=0.04, platform_height=0.0, platform_size=5, smooth_sigma=3, seed=917)) # Heightmap with platforms
-h = jnp.array(get_stairs_heightmap(a=300, b=300, start_col=200, step_depth=30, step_height=0.05))  # Heightmap with stairs
+# h = jnp.array(get_flat_heightmap(a=150, b=150, height=0.0))  # Flat heightmap for testing
+# h = jnp.array(get_rough_terrain_heightmap(a=200, b=200, sigma=0.05, platform_height=0.0, platform_size=2, smooth_sigma=3, seed=917)) # Heightmap with platforms
+# h = jnp.array(get_heightmap_ramp(a=100, b=200, ramp_height=0.4, ramp_depth=90, start_col=110))  # Heightmap with a ramp
+h = jnp.array(get_stairs_heightmap(a=100, b=100, start_col=60, step_depth=10, step_height=0.10))  # Heightmap with stairs
+
 
 
 terrain = Terrain(
     heightmap = h,
-    grid_cell_length = 0.01,  # Length of grid cells in heightmap
+    grid_cell_length = 0.04,  # Length of grid cells in heightmap [m/cell]
     mu = 0.6,
     gravity = jnp.array([0.0, 0.0, -9.81]),
 )

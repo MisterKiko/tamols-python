@@ -22,6 +22,7 @@ from .manual_heightmaps import (
     get_flat_heightmap,
     get_rough_terrain_heightmap,
     get_stairs_heightmap,
+    get_heightmap_ramp
 )
 
 from .plot_sol import plot_all_iterations
@@ -35,5 +36,5 @@ __all__ = [
     'get_flat_heightmap', 'get_rough_terrain_heightmap', 'get_stairs_heightmap',
     'Gait', 'Terrain', 'Robot', 'CurrentState',
     'plot_all_iterations', 'get_trajectory_function',
-    'show_map', 'save_heightmap_to_png', 
+    'show_map', 'save_heightmap_to_png', 'get_heightmap_ramp',
 ]

@@ -14,6 +14,7 @@ from .helpers import (
     scalar_triple_product,
     angular_momentum_dot_world_from_euler_xyz
 )
+from .batch_search import batch_search
 import time
 
 class TAMOLS():
@@ -83,15 +84,13 @@ class TAMOLS():
         self.grad_h_y = jnp.array(gyh)
         self.grad_h_s1_x = jnp.array(gx1)
         self.grad_h_s1_y = jnp.array(gy1)
+        self.laplacian_h = jnp.array(get_laplacian(terrain.heightmap, self.terrain.grid_cell_length))
+        self.search_radius = 0.1 # m
 
         # Virtual-floor gradients (for warm start)
         gx2, gy2 = compute_heightmap_gradients(self.h_s2, self.terrain.grid_cell_length)
-        h_s1_vf = jnp.array(get_hs1(self.h_s2))
-        gx1_vf, gy1_vf = compute_heightmap_gradients(h_s1_vf, self.terrain.grid_cell_length)
         self.grad_h2_x = jnp.array(gx2)
         self.grad_h2_y = jnp.array(gy2)
-        self.grad_h_s1_vf_x = jnp.array(gx1_vf)
-        self.grad_h_s1_vf_y = jnp.array(gy1_vf)
 
         # Decision vector and bounds
         x0 = build_initial_x0(gait, self.current_state)
@@ -217,8 +216,8 @@ class TAMOLS():
         # Select gradient fields based on use_virtual_floor
         grad_h_x   = jnp.where(cs.use_virtual_floor, self.grad_h2_x,        self.grad_h_x)
         grad_h_y   = jnp.where(cs.use_virtual_floor, self.grad_h2_y,        self.grad_h_y)
-        grad_h1_x  = jnp.where(cs.use_virtual_floor, self.grad_h_s1_vf_x,   self.grad_h_s1_x)
-        grad_h1_y  = jnp.where(cs.use_virtual_floor, self.grad_h_s1_vf_y,   self.grad_h_s1_y)
+        grad_h1_x  = jnp.where(cs.use_virtual_floor, self.grad_h2_x,   self.grad_h_s1_x)
+        grad_h1_y  = jnp.where(cs.use_virtual_floor, self.grad_h2_y,   self.grad_h_s1_y)
 
         # Per-limb "static" foothold costs
         def limb_static_cost(foot, prev_foot):
@@ -469,7 +468,7 @@ class TAMOLS():
         # Slack vars >= 0
         slack_var_constr = sv["slack_var"]  # (n_phases,)
 
-        return jnp.concatenate([fric, kin, az_g, slack_var_constr, giac, dyn_ineq])
+        return jnp.concatenate([fric, kin, az_g, slack_var_constr, giac, dyn_eq, dyn_ineq])
     
     # ============== Ipopt callbacks ==============
     def objective(self, x):
@@ -544,12 +543,22 @@ class TAMOLS():
             step_opt_time = 0.0
 
             if warm_start:
-                # Virtual-floor warm start (no re-JIT needed)
-                self.current_state.use_virtual_floor = jnp.array(False)  # set True if you want warm-start on h_s2
+                self.current_state.use_virtual_floor = jnp.array(True)  # if you want virtual-floor warm start
+                # Warm-start solve
                 t_ws0 = time.perf_counter()
                 x_ws, info_ws = self.run_single_optimization(options)
+                sv_ws = self._unravel(jnp.asarray(x_ws))
+
+                # Batch search (do not add to opt_times)
+                refined_sv = batch_search(
+                    self.terrain, self.gait, self.robot,
+                    np.asarray(self.grad_h_s1_x), np.asarray(self.grad_h_s1_y),
+                    np.asarray(self.h_s2), np.asarray(self.laplacian_h),
+                    sv_ws, getattr(self, "search_radius", 0.4)
+                )
+                x_ws_refined, _ = ravel_pytree(refined_sv)
+                self.x0 = np.asarray(x_ws_refined, dtype=float)
                 step_opt_time += time.perf_counter() - t_ws0
-                self.x0 = np.asarray(x_ws, dtype=float)
 
             # Main solve on real terrain
             self.current_state.use_virtual_floor = jnp.array(False)
