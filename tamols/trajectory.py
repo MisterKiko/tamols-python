@@ -4,6 +4,73 @@ from .helpers import *
 from .tamols_dataclasses import *
 from .problem_class import TAMOLS
 
+def _quintic_coeffs(p0, v0, a0, p1, v1, a1):
+    """
+    Solve for quintic coefficients c0..c5 (ascending powers) such that:
+      p(0)=p0, p'(0)=v0, p''(0)=a0, p(1)=p1, p'(1)=v1, p''(1)=a1
+    Works per component; pass scalars.
+    """
+    A = np.array([
+        [1, 0, 0,  0,  0,  0],   # p(0)
+        [0, 1, 0,  0,  0,  0],   # p'(0)
+        [0, 0, 2,  0,  0,  0],   # p''(0)
+        [1, 1, 1,  1,  1,  1],   # p(1)
+        [0, 1, 2,  3,  4,  5],   # p'(1)
+        [0, 0, 2,  6, 12, 20],   # p''(1)
+    ], dtype=float)
+    b = np.array([p0, v0, a0, p1, v1, a1], dtype=float)
+    return np.linalg.solve(A, b)  # c0..c5
+
+def get_quintic_spline_function(p_start: np.ndarray, p_mid: np.ndarray, p_end: np.ndarray):
+    """
+    Piecewise quintic over t in [0,1]:
+      - Zero velocity and acceleration at t=0 and t=1
+      - Pass through p_mid at t=0.5 with nonzero vel/acc (C2 continuous)
+    Time is normalized; returns a callable f(t)->R^3.
+    """
+    # 1) Use a clamped cubic to infer midpoint velocity and acceleration
+    t_knots = np.array([0.0, 0.5, 1.0])
+    pts = np.vstack([p_start, p_mid, p_end])
+    bc = ((1, np.zeros(3)), (1, np.zeros(3)))  # zero endpoint velocity
+    cubic = CubicSpline(t_knots, pts, axis=0, bc_type=bc)
+
+    v_mid = cubic(0.5, 1)  # first derivative at 0.5  -> shape (3,)
+    a_mid = cubic(0.5, 2)  # second derivative at 0.5 -> shape (3,)
+
+    # 2) Solve quintic coefficients per component for both halves
+    # First half: t in [0,0.5] mapped to s in [0,1]
+    c1 = np.vstack([
+        _quintic_coeffs(p_start[0], 0.0, 0.0, p_mid[0], v_mid[0], a_mid[0]),
+        _quintic_coeffs(p_start[1], 0.0, 0.0, p_mid[1], v_mid[1], a_mid[1]),
+        _quintic_coeffs(p_start[2], 0.0, 0.0, p_mid[2], v_mid[2], a_mid[2]),
+    ])  # shape (3,6), ascending powers
+
+    # Second half: t in (0.5,1] mapped to s in [0,1]
+    c2 = np.vstack([
+        _quintic_coeffs(p_mid[0], v_mid[0], a_mid[0], p_end[0], 0.0, 0.0),
+        _quintic_coeffs(p_mid[1], v_mid[1], a_mid[1], p_end[1], 0.0, 0.0),
+        _quintic_coeffs(p_mid[2], v_mid[2], a_mid[2], p_end[2], 0.0, 0.0),
+    ])  # shape (3,6)
+
+    def spline_func(t: float):
+        t = float(np.clip(t, 0.0, 1.0))
+        if t <= 0.5:
+            s = t * 2.0
+            coeffs = c1
+        else:
+            s = (t - 0.5) * 2.0
+            coeffs = c2
+        # Evaluate quintic: coeffs are ascending; polyval wants descending
+        xyz = np.array([
+            np.polyval(coeffs[0][::-1], s),
+            np.polyval(coeffs[1][::-1], s),
+            np.polyval(coeffs[2][::-1], s),
+        ])
+        return xyz
+
+    return spline_func
+
+
 def _build_leg_spline(p_start: np.ndarray, p_end: np.ndarray, apex_height: float, heightmap: np.ndarray, grid_cell_length: float):
     line_vec = p_end - p_start
     z_axis = np.array([0.0, 0.0, 1.0])
@@ -20,9 +87,7 @@ def _build_leg_spline(p_start: np.ndarray, p_end: np.ndarray, apex_height: float
     while s[2] < h:
         index += 1
         s = apex_height * index * normal + 0.5 * (p_start + p_end)
-    t_knots = np.array([0.0, 0.5, 1.0])  # normalized time within phase
-    pts = np.vstack([p_start, s, p_end])
-    return CubicSpline(t_knots, pts, axis=0)
+    return get_quintic_spline_function(p_start, s, p_end)
 
 def get_trajectory_function(results: list, problem: TAMOLS):
     """
