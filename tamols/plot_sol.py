@@ -86,3 +86,45 @@ def plot_all_iterations(sols, problem: TAMOLS, dt: float = 0.02):
     ax.legend(loc="upper right")
     plt.tight_layout()
     plt.show()
+
+def compute_base_velocities(sols, problem: TAMOLS, dt: float = 0.02):
+    """
+    Sample the trajectory and return base linear velocities over time.
+    Returns (times, base_vel) where base_vel has columns [vx, vy, vz].
+    """
+    traj_fn = get_trajectory_function(sols, problem)
+    times, _, base_pos, _ = traj_fn(dt)
+    base_vel = np.gradient(base_pos, dt, axis=0, edge_order=2)
+    return times, base_vel
+
+def plot_base(sols, problem: TAMOLS, dt: float = 0.02):
+    """
+    Plot base positional positions (x, y, z) and velocities (vx, vy, vz) over time.
+    """
+    traj_fn = get_trajectory_function(sols, problem)
+    times, _, base_pos, _ = traj_fn(dt)
+    base_vel = np.gradient(base_pos, dt, axis=0, edge_order=2)
+
+    fig, axs = plt.subplots(2, 1, figsize=(10, 6), sharex=True)
+
+    # Positions
+    axs[0].plot(times, base_pos[:, 0], label="x", color="tab:blue")
+    axs[0].plot(times, base_pos[:, 1], label="y", color="tab:orange")
+    axs[0].plot(times, base_pos[:, 2], label="z", color="tab:green")
+    axs[0].set_title("Base Position")
+    axs[0].set_ylabel("Position [m]")
+    axs[0].grid(True, alpha=0.3)
+    axs[0].legend(loc="best")
+
+    # Velocities
+    axs[1].plot(times, base_vel[:, 0], label="vx", color="tab:blue")
+    axs[1].plot(times, base_vel[:, 1], label="vy", color="tab:orange")
+    axs[1].plot(times, base_vel[:, 2], label="vz", color="tab:green")
+    axs[1].set_title("Base Positional Velocity")
+    axs[1].set_xlabel("Time [s]")
+    axs[1].set_ylabel("Velocity [m/s]")
+    axs[1].grid(True, alpha=0.3)
+    axs[1].legend(loc="best")
+
+    plt.tight_layout()
+    plt.show()

@@ -5,17 +5,6 @@ from tamols.helpers import bilinear_interp, evaluate_spline_position, euler_xyz_
 import math
 from jax.flatten_util import ravel_pytree
 
-def reachable_by_leg(p_i, i, p_B, rot_B, leg_length, hip_B):
-    """
-    Return a Python bool indicating if p_i is within leg reach for leg i.
-    """
-    R = euler_xyz_to_matrix(rot_B)            # jnp array OK
-    hip_world_i = p_B + R @ hip_B[i]          # jnp arrays
-    # Compute Euclidean distance as a Python float
-    diff = np.asarray(p_i - hip_world_i, dtype=float)
-    distance = float(np.linalg.norm(diff))
-    return distance <= float(leg_length)
-
 def batch_search(
     terrain: Terrain,
     gait: Gait,

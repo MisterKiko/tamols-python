@@ -1,28 +1,28 @@
 import jax.numpy as jnp
 from tamols.tamols_dataclasses import Gait, Terrain, Robot
-from tamols import TAMOLS, plot_all_iterations, get_trajectory_function
+from tamols import TAMOLS, plot_all_iterations, get_trajectory_function, plot_base
 from tamols.helpers import transform_inertia
 from tamols.manual_heightmaps import get_flat_heightmap, get_rough_terrain_heightmap, get_stairs_heightmap, get_heightmap_ramp
 from tamols.map_processing import save_heightmap_to_png, show_map
 
 gait = Gait(
-    n_steps=10,
+    n_steps=8,
     n_phases=2,
     spline_order=5,
     tau_k=jnp.array([1.0, 1.0]), # Time duration of phases [s]
     h_des=0.445,
     eps_min=0.1,
     weights = jnp.array([10.0e4, 0.001, 7.0, 100.0, 3.0, 0.01, 2.0, 0.001]),
-    desired_base_velocity = jnp.array([0.2, 0.0, 0.0]),
+    desired_base_velocity = jnp.array([0.3, 0.0, 0.0]),
     desired_base_angular_velocity = jnp.array([0.0, 0.0, 0.0]),
     apex_height=0.1,
     contact_schedule= jnp.array([
-        [1, 0, 0, 1],  # Phase 0 FL and RR in swing
-        [0, 1, 1, 0],  # Phase 1 FR and RL in swing
+        [0, 1, 1, 0],  # Phase 0: FR, RL in contact; FL, RR swing
+        [1, 0, 0, 1],  # Phase 1: FL, RR in contact; FR, RL swing
     ]),
     at_des_position= jnp.array([
-        [0, 1, 1, 0],  # Phase 0 FL and RR should be at desired pos
-        [1, 1, 1, 1],  # Phase 1 All feet should be at desired pos
+        [1, 0, 0, 1],  # Phase 0: move FL and RR
+        [1, 1, 1, 1],  # Phase 1: all at desired by the end
     ])
 )
 
@@ -64,11 +64,9 @@ robot = Robot(
 
 problem = TAMOLS(gait, terrain, robot)
 
-sols, infos = problem.run_repeated_optimizations(warm_start=True, options=
-        {
-            "max_iter": 300,
-            "acceptable_tol": 1e-3
-        })
+sols, infos = problem.run_repeated_optimizations()
+
+plot_base(sols, problem, dt=0.02)
 
 plot_all_iterations(sols, problem, dt=0.02)
 
